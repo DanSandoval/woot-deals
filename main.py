@@ -19,7 +19,7 @@ logging.basicConfig(
 
 # Configuration (use environment variables for sensitive data)
 WOOT_API_KEY = os.environ.get("WOOT_API_KEY")
-FEED_ENDPOINT = "https://developer.woot.com/feed/Electronics"
+FEED_ENDPOINT = "https://developer.woot.com/feed/All"  # Changed to All to search everything
 GETOFFERS_ENDPOINT = "https://developer.woot.com/getoffers"
 KEYWORDS = ["kindle", "ereader", "e-reader", "e-ink", "kobo", "nook", "eink", "treadmill", "walking pad", "iphone"]
 
@@ -134,38 +134,71 @@ def test_woot_api():
         
         if response.status_code == 200:
             feed_items = response.json()
-            logging.info(f"Successfully connected to feed endpoint. Received {len(feed_items)} items.")
+            logging.info(f"Successfully connected to feed endpoint. Received response data.")
             
-            # If we got feed items, test the getoffers endpoint with one item
-            if feed_items and len(feed_items) > 0:
-                offer_id = feed_items[0].get("OfferId")
-                if offer_id:
-                    logging.info(f"Testing connection to getoffers endpoint with OfferId: {offer_id}")
-                    getoffers_headers = {
-                        "x-api-key": WOOT_API_KEY,
-                        "Accept": "application/json",
-                        "Content-Type": "application/json"
-                    }
+            # Log details about the response structure
+            logging.info(f"Response type: {type(feed_items)}")
+            if isinstance(feed_items, list):
+                logging.info(f"Response is a list with {len(feed_items)} items")
+                if feed_items:
+                    sample_item = feed_items[0]
+                    logging.info(f"Sample item type: {type(sample_item)}")
+                    if isinstance(sample_item, dict):
+                        logging.info(f"Sample item keys: {list(sample_item.keys())}")
+                        # Print a snippet of the sample item
+                        logged_sample = {k: v for k, v in sample_item.items() if k in ['OfferId', 'Id', 'Title', 'Url']}
+                        logging.info(f"Sample item values: {json.dumps(logged_sample, indent=2)}")
+            else:
+                logging.info(f"Response is not a list. Type: {type(feed_items)}")
+            
+            # Try to find an offer ID to test the getoffers endpoint
+            offer_id = None
+            if isinstance(feed_items, list) and feed_items:
+                for item in feed_items:
+                    if isinstance(item, dict):
+                        # Check common ID field names based on API docs
+                        if "OfferId" in item:
+                            offer_id = item["OfferId"]
+                            logging.info(f"Found OfferId: {offer_id}")
+                            break
+                        elif "Id" in item:
+                            offer_id = item["Id"]
+                            logging.info(f"Found Id: {offer_id}")
+                            break
+            
+            if offer_id:
+                logging.info(f"Testing connection to getoffers endpoint with OfferId: {offer_id}")
+                getoffers_headers = {
+                    "x-api-key": WOOT_API_KEY,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                }
+                
+                getoffers_response = requests.post(
+                    GETOFFERS_ENDPOINT,
+                    headers=getoffers_headers,
+                    data=json.dumps([offer_id])
+                )
+                
+                if getoffers_response.status_code == 200:
+                    detailed_offers = getoffers_response.json()
+                    logging.info(f"Successfully connected to getoffers endpoint. Received {len(detailed_offers) if isinstance(detailed_offers, list) else 'non-list'} response.")
                     
-                    getoffers_response = requests.post(
-                        GETOFFERS_ENDPOINT,
-                        headers=getoffers_headers,
-                        data=json.dumps([offer_id])
-                    )
+                    if isinstance(detailed_offers, list) and detailed_offers:
+                        sample_offer = detailed_offers[0]
+                        if isinstance(sample_offer, dict):
+                            # Log the structure of a detailed offer
+                            logging.info(f"Detailed offer keys: {list(sample_offer.keys())}")
+                            logged_offer = {k: v for k, v in sample_offer.items() if k in ['Id', 'Title', 'Url']}
+                            logging.info(f"Sample detailed offer: {json.dumps(logged_offer, indent=2)}")
                     
-                    if getoffers_response.status_code == 200:
-                        detailed_offers = getoffers_response.json()
-                        logging.info(f"Successfully connected to getoffers endpoint. Received {len(detailed_offers)} detailed offers.")
-                        return True
-                    else:
-                        logging.error(f"Failed to connect to getoffers endpoint. Status code: {getoffers_response.status_code}")
-                        logging.error(f"Response: {getoffers_response.text}")
-                        return False
+                    return True
                 else:
-                    logging.warning("No OfferId found in feed items. Cannot test getoffers endpoint.")
+                    logging.error(f"Failed to connect to getoffers endpoint. Status code: {getoffers_response.status_code}")
+                    logging.error(f"Response: {getoffers_response.text}")
                     return False
             else:
-                logging.warning("No feed items received. Cannot test getoffers endpoint.")
+                logging.warning("No suitable ID found in feed items to test getoffers endpoint. Feed endpoint is working though.")
                 return True  # Still return True as feed endpoint worked
         else:
             logging.error(f"Failed to connect to feed endpoint. Status code: {response.status_code}")
@@ -302,14 +335,34 @@ def fetch_feed():
             
         response.raise_for_status()
         feed_items = response.json()
-        logging.info(f"Fetched {len(feed_items)} feed items from the API.")
         
-        # Log a sample of the feed items
-        if feed_items and len(feed_items) > 0:
-            sample_item = feed_items[0]
-            logging.info(f"Sample feed item: {json.dumps(sample_item, indent=2)}")
+        # Convert to normalized format for processing
+        normalized_items = []
+        
+        if isinstance(feed_items, list):
+            logging.info(f"Fetched {len(feed_items)} feed items from the API")
             
-        return feed_items
+            for item in feed_items:
+                if isinstance(item, dict):
+                    # Make sure we have a consistent ID field
+                    processed_item = item.copy()
+                    
+                    # Use OfferId as the primary ID, falling back to Id if needed
+                    if "OfferId" in item:
+                        processed_item["Id"] = item["OfferId"]
+                    elif "Id" in item:
+                        processed_item["OfferId"] = item["Id"]
+                        
+                    normalized_items.append(processed_item)
+        else:
+            logging.warning(f"API returned non-list response: {type(feed_items)}")
+                    
+        # Log a sample of the feed items
+        if normalized_items and len(normalized_items) > 0:
+            sample_item = normalized_items[0]
+            logging.info(f"Sample normalized feed item: {json.dumps({k: v for k, v in sample_item.items() if k in ['Id', 'OfferId', 'Title', 'Url']}, indent=2)}")
+            
+        return normalized_items
     except Exception as e:
         logging.error(f"Error fetching feed: {e}")
         logging.error(traceback.format_exc())
@@ -349,14 +402,19 @@ def fetch_detailed_offers(offer_ids):
             
         response.raise_for_status()
         detailed_offers = response.json()
-        logging.info(f"Fetched {len(detailed_offers)} detailed offers from the API.")
         
-        # Log a sample of the detailed offers
-        if detailed_offers and len(detailed_offers) > 0:
-            sample_offer = detailed_offers[0]
-            logging.info(f"Sample detailed offer: {json.dumps(sample_offer, indent=2)}")
+        if isinstance(detailed_offers, list):
+            logging.info(f"Fetched {len(detailed_offers)} detailed offers from the API.")
             
-        return detailed_offers
+            # Log a sample of the detailed offers
+            if detailed_offers and len(detailed_offers) > 0:
+                sample_offer = detailed_offers[0]
+                logging.info(f"Sample detailed offer structure: {json.dumps({k: v for k, v in sample_offer.items() if k in ['Id', 'Title', 'Url']}, indent=2)}")
+                
+            return detailed_offers
+        else:
+            logging.warning(f"Detailed offers response is not a list: {type(detailed_offers)}")
+            return []
     except Exception as e:
         logging.error(f"Error fetching detailed offers: {e}")
         logging.error(traceback.format_exc())
@@ -364,7 +422,8 @@ def fetch_detailed_offers(offer_ids):
 
 def is_matching_deal(deal):
     """Check if a deal matches our keywords."""
-    deal_id = deal.get("Id", "unknown")
+    # Use either Id or OfferId, whichever is available
+    deal_id = deal.get("Id", deal.get("OfferId", "unknown"))
     logging.info(f"Checking if deal {deal_id} matches keywords")
     
     # Check title
@@ -385,6 +444,18 @@ def is_matching_deal(deal):
         logging.info(f"Deal {deal_id} matches keywords in features")
         return True
         
+    # Check subtitle if available
+    subtitle = deal.get("Subtitle", "").lower()
+    if any(keyword.lower() in subtitle for keyword in KEYWORDS):
+        logging.info(f"Deal {deal_id} matches keywords in subtitle")
+        return True
+    
+    # Check snippet if available
+    snippet = deal.get("Snippet", "").lower()
+    if any(keyword.lower() in snippet for keyword in KEYWORDS):
+        logging.info(f"Deal {deal_id} matches keywords in snippet")
+        return True
+        
     logging.info(f"Deal {deal_id} does not match any keywords")
     return False
 
@@ -394,9 +465,10 @@ def filter_deals(deals, seen_deals):
     new_matching_deals = []
     
     for deal in deals:
-        unique_id = deal.get("Id")
+        # Try both Id and OfferId fields for compatibility
+        unique_id = deal.get("Id", deal.get("OfferId"))
         if not unique_id:
-            logging.warning(f"Deal has no Id: {json.dumps(deal, indent=2)}")
+            logging.warning(f"Deal has no Id or OfferId: {json.dumps({k: v for k, v in deal.items() if k in ['Title', 'Url']}, indent=2)}")
             continue
             
         if unique_id in seen_deals:
@@ -412,29 +484,52 @@ def filter_deals(deals, seen_deals):
 
 def format_deal_email(deal):
     """Format a deal for email notification."""
-    deal_id = deal.get("Id", "unknown")
+    deal_id = deal.get("Id", deal.get("OfferId", "unknown"))
     logging.info(f"Formatting email for deal {deal_id}")
     
     title = deal.get("Title", "No Title")
     url = deal.get("Url", "No URL")
     
-    # Get price information
+    # Get price information - handle different possible structures
+    price_info = "Price unknown"
+    
+    # Try to get price from Items field
     items = deal.get("Items", [])
-    if items:
-        sale_price = items[0].get("SalePrice", "Unknown")
-        list_price = items[0].get("ListPrice", "Unknown")
-        savings = ""
-        if isinstance(sale_price, (int, float)) and isinstance(list_price, (int, float)):
-            if list_price > sale_price:
-                savings = f" (Save ${list_price - sale_price:.2f})"
-        price_info = f"${sale_price}{savings}"
-    else:
-        price_info = "Price unknown"
+    if items and isinstance(items, list) and len(items) > 0:
+        sale_price = items[0].get("SalePrice", None)
+        list_price = items[0].get("ListPrice", None)
+        
+        if sale_price is not None:
+            savings = ""
+            if list_price is not None and isinstance(sale_price, (int, float)) and isinstance(list_price, (int, float)):
+                if list_price > sale_price:
+                    savings = f" (Save ${list_price - sale_price:.2f})"
+            price_info = f"${sale_price}{savings}"
+    
+    # Try SalePrice field directly on the deal
+    elif "SalePrice" in deal:
+        sale_price = deal.get("SalePrice")
+        list_price = deal.get("ListPrice")
+        
+        if isinstance(sale_price, list) and len(sale_price) > 0:
+            # Handle price range format
+            min_price = sale_price[0].get("Minimum", None)
+            if min_price is not None:
+                price_info = f"${min_price}"
+        elif sale_price is not None:
+            savings = ""
+            if list_price is not None and isinstance(sale_price, (int, float)) and isinstance(list_price, (int, float)):
+                if list_price > sale_price:
+                    savings = f" (Save ${list_price - sale_price:.2f})"
+            price_info = f"${sale_price}{savings}"
     
     # Extract a snippet from the description
     description = deal.get("WriteUpIntro", "")
     if not description:
         description = deal.get("Snippet", "")
+    if not description:
+        description = deal.get("Subtitle", "")
+    
     if len(description) > 200:
         description = description[:197] + "..."
     
@@ -445,7 +540,7 @@ def format_deal_email(deal):
 <p>{description}</p>
 <p><a href="{url}">View on Woot!</a></p>
 <hr>
-<p><small>Sent by your Woot Kindle Deals alert system</small></p>
+<p><small>Sent by your Woot Deals alert system</small></p>
 """
     logging.info(f"Email formatted for deal {deal_id}")
     return title, email_body
@@ -460,7 +555,7 @@ def send_email(deals):
     try:
         # Create message container
         msg = MIMEMultipart('alternative')
-        msg['Subject'] = f"Kindle Alert: {len(deals)} new e-reader deal(s) on Woot!"
+        msg['Subject'] = f"Woot Alert: {len(deals)} new deal(s) matching your keywords"
         msg['From'] = GMAIL_USER
         msg['To'] = EMAIL_RECIPIENT
         
@@ -565,21 +660,30 @@ def check_woot_deals(request):
     # Load previously seen deal IDs
     seen_deals = load_seen_deals()
     
-    # Step 1: Fetch the feed to get offer IDs
+    # Step 1: Fetch the feed to get basic deal information
     feed_items = fetch_feed()
     if not feed_items:
         logging.info("No feed items found. Exiting.")
         return "No feed items found"
         
-    # Extract offer IDs
-    offer_ids = [item.get("OfferId") for item in feed_items if item.get("OfferId")]
+    # Extract offer IDs for fetching detailed information
+    offer_ids = []
+    for item in feed_items:
+        if "OfferId" in item:
+            offer_ids.append(item["OfferId"])
+        elif "Id" in item:
+            offer_ids.append(item["Id"])
+    
     logging.info(f"Extracted {len(offer_ids)} offer IDs from feed items")
     
     # Step 2: Fetch detailed information for these offers
     detailed_offers = fetch_detailed_offers(offer_ids)
     
+    # Use detailed offers if available, otherwise use feed items
+    items_to_check = detailed_offers if detailed_offers else feed_items
+    
     # Step 3: Filter for new matching deals
-    new_matching_deals = filter_deals(detailed_offers, seen_deals)
+    new_matching_deals = filter_deals(items_to_check, seen_deals)
     
     # Step 4: Send email notifications if we found any deals
     if new_matching_deals:
@@ -588,7 +692,9 @@ def check_woot_deals(request):
         
         # Add to seen deals
         for deal in new_matching_deals:
-            seen_deals.append(deal.get("Id"))
+            unique_id = deal.get("Id", deal.get("OfferId"))
+            if unique_id:
+                seen_deals.append(unique_id)
             
         # Save updated seen deals
         save_seen_deals(seen_deals)
