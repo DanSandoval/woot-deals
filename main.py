@@ -9,6 +9,7 @@ import os
 from google.cloud import storage
 import sys
 import traceback
+from flask import Flask, request
 
 # Set up detailed logging
 logging.basicConfig(
@@ -40,9 +41,13 @@ except Exception as e:
     logging.error(f"Error initializing storage client: {e}")
     logging.error(traceback.format_exc())
 
+# Create Flask app
+app = Flask(__name__)
+
 def test_environment_variables():
     """Test if all required environment variables are set."""
     logging.info("=== TESTING ENVIRONMENT VARIABLES ===")
+    
     required_vars = {
         "WOOT_API_KEY": WOOT_API_KEY,
         "GMAIL_USER": GMAIL_USER,
@@ -520,7 +525,7 @@ def run_all_tests():
 
 def check_woot_deals(request):
     """
-    Cloud Function entry point.
+    Main function to check for Woot deals.
     This function can be triggered by HTTP request or Cloud Scheduler.
     """
     # Extract test mode from request if provided
@@ -594,3 +599,19 @@ def check_woot_deals(request):
         result_message = "No new matching deals found."
         logging.info(result_message)
         return result_message
+
+# Flask route handler
+@app.route('/', methods=['GET'])
+def handle_request():
+    return check_woot_deals(request)
+
+# Health check endpoint
+@app.route('/health', methods=['GET'])
+def health_check():
+    return "OK", 200
+
+# Start the server when run directly
+if __name__ == "__main__":
+    port = int(os.environ.get('PORT', 8080))
+    logging.info(f"Starting Flask server on port {port}")
+    app.run(host='0.0.0.0', port=port)
