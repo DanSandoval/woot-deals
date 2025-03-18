@@ -19,8 +19,8 @@ logging.basicConfig(
 
 # Configuration (use environment variables for sensitive data)
 WOOT_API_KEY = os.environ.get("WOOT_API_KEY")
-FEED_ENDPOINT = "https://developer.woot.com/Affiliates/feed/Electronics"
-GETOFFERS_ENDPOINT = "https://developer.woot.com/Affiliates/getoffers"
+FEED_ENDPOINT = "https://developer.woot.com/feed/Electronics"
+GETOFFERS_ENDPOINT = "https://developer.woot.com/getoffers"
 KEYWORDS = ["kindle", "ereader", "e-reader", "e-ink", "kobo", "nook", "eink", "treadmill", "walking pad", "iphone"]
 
 # Gmail configuration
