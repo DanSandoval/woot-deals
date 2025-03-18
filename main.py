@@ -600,12 +600,24 @@ def check_woot_deals(request):
         logging.info(result_message)
         return result_message
 
-# Flask route handler
-@app.route('/', methods=['GET'])
-def handle_request():
-    return check_woot_deals(request)
+# Add catch-all route handlers
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def catch_all(path):
+    try:
+        if path == 'health':
+            return "OK", 200
+        elif request.args.get('test'):
+            test_mode = request.args.get('test')
+            return check_woot_deals(request)
+        else:
+            return check_woot_deals(request)
+    except Exception as e:
+        logging.error(f"Error handling request: {e}")
+        logging.error(traceback.format_exc())
+        return f"Error: {str(e)}", 500
 
-# Health check endpoint
+# Keep the health endpoint for backward compatibility
 @app.route('/health', methods=['GET'])
 def health_check():
     return "OK", 200
