@@ -21,7 +21,7 @@ logging.basicConfig(
 WOOT_API_KEY = os.environ.get("WOOT_API_KEY")
 FEED_ENDPOINT = "https://developer.woot.com/Affiliates/feed/Electronics"
 GETOFFERS_ENDPOINT = "https://developer.woot.com/Affiliates/getoffers"
-KEYWORDS = ["kindle", "ereader", "e-reader", "e-ink", "kobo", "nook", "eink"]
+KEYWORDS = ["kindle", "ereader", "e-reader", "e-ink", "kobo", "nook", "eink", "treadmill", "walking pad", "iphone"]
 
 # Gmail configuration
 GMAIL_USER = os.environ.get("GMAIL_USER")
