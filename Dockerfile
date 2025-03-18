@@ -16,3 +16,4 @@ ENV PYTHONUNBUFFERED=1
 
 # Command to run the application
 CMD ["python", "main.py"]
+

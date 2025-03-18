@@ -133,30 +133,66 @@ def test_woot_api():
         response = requests.get(FEED_ENDPOINT, headers=headers)
         
         if response.status_code == 200:
-            feed_items = response.json()
+            api_response = response.json()
             logging.info(f"Successfully connected to feed endpoint. Received response data.")
             
             # Log details about the response structure
-            logging.info(f"Response type: {type(feed_items)}")
-            if isinstance(feed_items, list):
-                logging.info(f"Response is a list with {len(feed_items)} items")
-                if feed_items:
-                    sample_item = feed_items[0]
+            logging.info(f"Response type: {type(api_response)}")
+            
+            if isinstance(api_response, dict):
+                logging.info(f"API returned dictionary with keys: {list(api_response.keys())}")
+                # Log the first level of the response to understand the structure
+                for key, value in api_response.items():
+                    value_type = type(value)
+                    if isinstance(value, (list, dict)):
+                        size_info = f" with {len(value)} items" if hasattr(value, "__len__") else ""
+                        logging.info(f"Key '{key}' has value of type {value_type}{size_info}")
+                    else:
+                        value_preview = str(value)[:50] + "..." if len(str(value)) > 50 else str(value)
+                        logging.info(f"Key '{key}' has value: {value_preview}")
+                
+                # Try to find where the item list might be
+                potential_items = []
+                for key, value in api_response.items():
+                    if isinstance(value, list) and len(value) > 0:
+                        if isinstance(value[0], dict):
+                            logging.info(f"Found potential items list under key '{key}'")
+                            logging.info(f"First item keys: {list(value[0].keys())}")
+                            potential_items.append((key, value))
+                
+                # Try to find an offer ID from any potential item lists
+                offer_id = None
+                for key, items in potential_items:
+                    for item in items:
+                        if isinstance(item, dict):
+                            # Check common ID field names
+                            if "OfferId" in item:
+                                offer_id = item["OfferId"]
+                                logging.info(f"Found OfferId '{offer_id}' in item from '{key}' list")
+                                break
+                            elif "Id" in item:
+                                offer_id = item["Id"]
+                                logging.info(f"Found Id '{offer_id}' in item from '{key}' list")
+                                break
+                    if offer_id:
+                        break
+            
+            elif isinstance(api_response, list):
+                logging.info(f"Response is a list with {len(api_response)} items")
+                if api_response:
+                    sample_item = api_response[0]
                     logging.info(f"Sample item type: {type(sample_item)}")
                     if isinstance(sample_item, dict):
                         logging.info(f"Sample item keys: {list(sample_item.keys())}")
                         # Print a snippet of the sample item
                         logged_sample = {k: v for k, v in sample_item.items() if k in ['OfferId', 'Id', 'Title', 'Url']}
                         logging.info(f"Sample item values: {json.dumps(logged_sample, indent=2)}")
-            else:
-                logging.info(f"Response is not a list. Type: {type(feed_items)}")
-            
-            # Try to find an offer ID to test the getoffers endpoint
-            offer_id = None
-            if isinstance(feed_items, list) and feed_items:
-                for item in feed_items:
+                
+                # Try to find an offer ID from the list items
+                offer_id = None
+                for item in api_response:
                     if isinstance(item, dict):
-                        # Check common ID field names based on API docs
+                        # Check common ID field names
                         if "OfferId" in item:
                             offer_id = item["OfferId"]
                             logging.info(f"Found OfferId: {offer_id}")
@@ -166,6 +202,16 @@ def test_woot_api():
                             logging.info(f"Found Id: {offer_id}")
                             break
             
+            else:
+                logging.info(f"Response is neither a list nor a dict. Type: {type(api_response)}")
+                # Dump as string to get a sense of what it is
+                logging.info(f"Response preview: {str(api_response)[:500]}...")
+                
+            # Log full response structure (truncated) for analysis
+            response_str = json.dumps(api_response, indent=2)
+            logging.info(f"Full response structure (truncated): {response_str[:1000]}...")
+                
+            # Test the getoffers endpoint if we found an ID
             if offer_id:
                 logging.info(f"Testing connection to getoffers endpoint with OfferId: {offer_id}")
                 getoffers_headers = {
@@ -196,7 +242,8 @@ def test_woot_api():
                 else:
                     logging.error(f"Failed to connect to getoffers endpoint. Status code: {getoffers_response.status_code}")
                     logging.error(f"Response: {getoffers_response.text}")
-                    return False
+                    # Still return True as the feed endpoint worked
+                    return True
             else:
                 logging.warning("No suitable ID found in feed items to test getoffers endpoint. Feed endpoint is working though.")
                 return True  # Still return True as feed endpoint worked
@@ -334,15 +381,65 @@ def fetch_feed():
             return []
             
         response.raise_for_status()
-        feed_items = response.json()
+        api_response = response.json()
         
         # Convert to normalized format for processing
         normalized_items = []
         
-        if isinstance(feed_items, list):
-            logging.info(f"Fetched {len(feed_items)} feed items from the API")
+        if isinstance(api_response, dict):
+            # Log the structure of the dictionary to understand it
+            logging.info(f"API returned dictionary with keys: {list(api_response.keys())}")
             
-            for item in feed_items:
+            # Try to find where the item list might be
+            potential_item_keys = []
+            for key, value in api_response.items():
+                logging.info(f"Key '{key}' has value of type: {type(value)}")
+                if isinstance(value, list):
+                    potential_item_keys.append(key)
+                    logging.info(f"Found list under key '{key}' with {len(value)} items")
+                    
+            # Try common field names where items might be
+            item_list = None
+            for key in ['items', 'data', 'offers', 'results', 'deals', 'feed'] + potential_item_keys:
+                if key in api_response and isinstance(api_response[key], list):
+                    item_list = api_response[key]
+                    logging.info(f"Found items list under key '{key}' with {len(item_list)} items")
+                    break
+            
+            # If we found a list of items, process them
+            if item_list:
+                for item in item_list:
+                    if isinstance(item, dict):
+                        # Make sure we have a consistent ID field
+                        processed_item = item.copy()
+                        
+                        # Use OfferId as the primary ID, falling back to Id if needed
+                        if "OfferId" in item:
+                            processed_item["Id"] = item["OfferId"]
+                        elif "Id" in item:
+                            processed_item["OfferId"] = item["Id"]
+                            
+                        normalized_items.append(processed_item)
+                        
+                # Log full structure of a sample item to understand what's available
+                if len(item_list) > 0:
+                    logging.info(f"Sample raw item: {json.dumps(item_list[0], indent=2)[:500]}...")
+            else:
+                # If we couldn't find a list, try to extract fields from the response itself
+                logging.info(f"Could not find a list of items in the response structure")
+                logging.info(f"Full API response structure: {json.dumps(api_response, indent=2)[:500]}...")
+                
+                # As a fallback, if the response is short, add it as a single item
+                normalized_items.append({
+                    "Id": "response",
+                    "OfferId": "response",
+                    "RawResponse": api_response
+                })
+                
+        elif isinstance(api_response, list):
+            logging.info(f"API returned list with {len(api_response)} items")
+            
+            for item in api_response:
                 if isinstance(item, dict):
                     # Make sure we have a consistent ID field
                     processed_item = item.copy()
@@ -354,14 +451,19 @@ def fetch_feed():
                         processed_item["OfferId"] = item["Id"]
                         
                     normalized_items.append(processed_item)
+            
+            # Log full structure of a sample item to understand what's available
+            if len(api_response) > 0:
+                logging.info(f"Sample raw item: {json.dumps(api_response[0], indent=2)[:500]}...")
         else:
-            logging.warning(f"API returned non-list response: {type(feed_items)}")
+            logging.warning(f"API returned unexpected response type: {type(api_response)}")
                     
-        # Log a sample of the feed items
+        # Log a sample of the normalized items
         if normalized_items and len(normalized_items) > 0:
             sample_item = normalized_items[0]
-            logging.info(f"Sample normalized feed item: {json.dumps({k: v for k, v in sample_item.items() if k in ['Id', 'OfferId', 'Title', 'Url']}, indent=2)}")
+            logging.info(f"Sample normalized item: {json.dumps({k: v for k, v in sample_item.items() if k in ['Id', 'OfferId', 'Title', 'Url']}, indent=2)}")
             
+        logging.info(f"Normalized {len(normalized_items)} items from the API response")
         return normalized_items
     except Exception as e:
         logging.error(f"Error fetching feed: {e}")
