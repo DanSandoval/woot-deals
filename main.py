@@ -476,52 +476,50 @@ def fetch_detailed_offers(offer_ids):
         logging.info("No offer IDs provided. Skipping detailed offers fetch.")
         return []
     
-    # Process the batch of offer IDs (25 at a time is the API limit)
     batch_size = 25
-    batch_ids = offer_ids[:batch_size]
-    logging.info(f"Fetching detailed information for {len(batch_ids)} offer IDs")
+    all_detailed_offers = []
     
-    headers = {
-        "x-api-key": WOOT_API_KEY,
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-    }
-    
-    try:
-        logging.info(f"Making request to {GETOFFERS_ENDPOINT}")
-        logging.info(f"Request data: {json.dumps(batch_ids)}")
+    # Process in batches of 25 (API limit)
+    for i in range(0, len(offer_ids), batch_size):
+        batch = offer_ids[i:i+batch_size]
+        logging.info(f"Fetching details for batch {i//batch_size + 1}/{(len(offer_ids)+batch_size-1)//batch_size} with {len(batch)} offer IDs")
         
-        response = requests.post(
-            GETOFFERS_ENDPOINT, 
-            headers=headers, 
-            data=json.dumps(batch_ids)
-        )
+        headers = {
+            "x-api-key": WOOT_API_KEY,
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }
         
-        logging.info(f"Received response with status code: {response.status_code}")
-        
-        if response.status_code != 200:
-            logging.error(f"Error response: {response.text}")
-            return []
+        try:
+            logging.info(f"Making request to {GETOFFERS_ENDPOINT}")
+            logging.info(f"Request data: {json.dumps(batch)}")
             
-        response.raise_for_status()
-        detailed_offers = response.json()
-        
-        if isinstance(detailed_offers, list):
-            logging.info(f"Fetched {len(detailed_offers)} detailed offers from the API.")
+            response = requests.post(
+                GETOFFERS_ENDPOINT, 
+                headers=headers, 
+                data=json.dumps(batch)
+            )
             
-            # Log a sample of the detailed offers
-            if detailed_offers and len(detailed_offers) > 0:
-                sample_offer = detailed_offers[0]
-                logging.info(f"Sample detailed offer structure: {json.dumps({k: v for k, v in sample_offer.items() if k in ['Id', 'Title', 'Url']}, indent=2)}")
+            logging.info(f"Received response with status code: {response.status_code}")
+            
+            if response.status_code != 200:
+                logging.error(f"Error response: {response.text}")
+                continue
                 
-            return detailed_offers
-        else:
-            logging.warning(f"Detailed offers response is not a list: {type(detailed_offers)}")
-            return []
-    except Exception as e:
-        logging.error(f"Error fetching detailed offers: {e}")
-        logging.error(traceback.format_exc())
-        return []
+            response.raise_for_status()
+            detailed_offers = response.json()
+            
+            if isinstance(detailed_offers, list):
+                logging.info(f"Fetched {len(detailed_offers)} detailed offers from the API.")
+                all_detailed_offers.extend(detailed_offers)
+            else:
+                logging.warning(f"Detailed offers response is not a list: {type(detailed_offers)}")
+        except Exception as e:
+            logging.error(f"Error fetching detailed offers batch: {e}")
+            logging.error(traceback.format_exc())
+    
+    logging.info(f"Total detailed offers fetched: {len(all_detailed_offers)}")
+    return all_detailed_offers
 
 def is_matching_deal(deal):
     """Check if a deal matches our keywords."""
@@ -846,7 +844,7 @@ def check_woot_deals(request):
         # Fetch detailed information for this batch
         detailed_offers = fetch_detailed_offers(batch)
         
-        # Filter for new matching deals (full check with all fields)
+        # Step 4: Filter for new matching deals (full check with all fields)
         batch_matching_deals = filter_deals(detailed_offers, seen_deals)
         
         # Add new matches to our results list
@@ -858,7 +856,7 @@ def check_woot_deals(request):
             if unique_id and unique_id not in seen_deals:
                 seen_deals.append(unique_id)
     
-    # Step 4: Send notifications if we found any matching deals
+    # Send notifications if we found any matching deals
     if all_matching_deals:
         logging.info(f"Found a total of {len(all_matching_deals)} new matching deals. Sending notifications.")
         send_notifications(all_matching_deals)
