@@ -365,106 +365,69 @@ def save_seen_deals(seen_deals):
         return False
 
 def fetch_feed():
-    """Fetch the feed from the Woot API."""
+    """Fetch the feed from the Woot API with pagination support."""
     logging.info("Fetching feed from Woot API")
     headers = {
         "x-api-key": WOOT_API_KEY,
         "Accept": "application/json"
     }
+    
+    all_items = []
+    current_page = 1
+    total_pages = 1  # Initialize to at least 1 page
+    
     try:
-        logging.info(f"Making request to {FEED_ENDPOINT}")
-        response = requests.get(FEED_ENDPOINT, headers=headers)
-        logging.info(f"Received response with status code: {response.status_code}")
-        
-        if response.status_code != 200:
-            logging.error(f"Error response: {response.text}")
-            return []
+        while current_page <= total_pages:
+            # Add page parameter for pagination
+            page_url = f"{FEED_ENDPOINT}?page={current_page}"
+            logging.info(f"Making request to page {current_page} of {total_pages}: {page_url}")
+            response = requests.get(page_url, headers=headers)
+            logging.info(f"Received response with status code: {response.status_code}")
             
-        response.raise_for_status()
-        api_response = response.json()
-        
-        # Convert to normalized format for processing
-        normalized_items = []
-        
-        if isinstance(api_response, dict):
-            # Log the structure of the dictionary to understand it
-            logging.info(f"API returned dictionary with keys: {list(api_response.keys())}")
+            if response.status_code != 200:
+                logging.error(f"Error response: {response.text}")
+                break
+                
+            response.raise_for_status()
+            api_response = response.json()
             
-            # Try to find where the item list might be
-            potential_item_keys = []
-            for key, value in api_response.items():
-                logging.info(f"Key '{key}' has value of type: {type(value)}")
-                if isinstance(value, list):
-                    potential_item_keys.append(key)
-                    logging.info(f"Found list under key '{key}' with {len(value)} items")
-                    
-            # Try common field names where items might be
-            item_list = None
-            for key in ['items', 'data', 'offers', 'results', 'deals', 'feed'] + potential_item_keys:
-                if key in api_response and isinstance(api_response[key], list):
-                    item_list = api_response[key]
-                    logging.info(f"Found items list under key '{key}' with {len(item_list)} items")
-                    break
+            # Update total pages if available in response
+            if isinstance(api_response, dict) and "TotalPages" in api_response:
+                total_pages = max(total_pages, api_response["TotalPages"])
+                logging.info(f"Updated total pages to {total_pages}")
             
-            # If we found a list of items, process them
-            if item_list:
-                for item in item_list:
-                    if isinstance(item, dict):
-                        # Make sure we have a consistent ID field
-                        processed_item = item.copy()
-                        
-                        # Use OfferId as the primary ID, falling back to Id if needed
-                        if "OfferId" in item:
-                            processed_item["Id"] = item["OfferId"]
-                        elif "Id" in item:
-                            processed_item["OfferId"] = item["Id"]
+            # Extract and normalize items from this page
+            page_items = []
+            
+            if isinstance(api_response, dict):
+                item_list = None
+                if "Items" in api_response and isinstance(api_response["Items"], list):
+                    item_list = api_response["Items"]
+                    logging.info(f"Found {len(item_list)} items on page {current_page}")
+                
+                # Process items from this page
+                if item_list:
+                    for item in item_list:
+                        if isinstance(item, dict):
+                            # Make sure we have a consistent ID field
+                            processed_item = item.copy()
                             
-                        normalized_items.append(processed_item)
-                        
-                # Log full structure of a sample item to understand what's available
-                if len(item_list) > 0:
-                    logging.info(f"Sample raw item: {json.dumps(item_list[0], indent=2)[:500]}...")
-            else:
-                # If we couldn't find a list, try to extract fields from the response itself
-                logging.info(f"Could not find a list of items in the response structure")
-                logging.info(f"Full API response structure: {json.dumps(api_response, indent=2)[:500]}...")
+                            # Use OfferId as the primary ID, falling back to Id if needed
+                            if "OfferId" in item:
+                                processed_item["Id"] = item["OfferId"]
+                            elif "Id" in item:
+                                processed_item["OfferId"] = item["Id"]
+                                
+                            page_items.append(processed_item)
                 
-                # As a fallback, if the response is short, add it as a single item
-                normalized_items.append({
-                    "Id": "response",
-                    "OfferId": "response",
-                    "RawResponse": api_response
-                })
-                
-        elif isinstance(api_response, list):
-            logging.info(f"API returned list with {len(api_response)} items")
+                # Add items from this page to our total
+                all_items.extend(page_items)
             
-            for item in api_response:
-                if isinstance(item, dict):
-                    # Make sure we have a consistent ID field
-                    processed_item = item.copy()
-                    
-                    # Use OfferId as the primary ID, falling back to Id if needed
-                    if "OfferId" in item:
-                        processed_item["Id"] = item["OfferId"]
-                    elif "Id" in item:
-                        processed_item["OfferId"] = item["Id"]
-                        
-                    normalized_items.append(processed_item)
-            
-            # Log full structure of a sample item to understand what's available
-            if len(api_response) > 0:
-                logging.info(f"Sample raw item: {json.dumps(api_response[0], indent=2)[:500]}...")
-        else:
-            logging.warning(f"API returned unexpected response type: {type(api_response)}")
-                    
-        # Log a sample of the normalized items
-        if normalized_items and len(normalized_items) > 0:
-            sample_item = normalized_items[0]
-            logging.info(f"Sample normalized item: {json.dumps({k: v for k, v in sample_item.items() if k in ['Id', 'OfferId', 'Title', 'Url']}, indent=2)}")
-            
-        logging.info(f"Normalized {len(normalized_items)} items from the API response")
-        return normalized_items
+            # Move to the next page
+            current_page += 1
+        
+        logging.info(f"Fetched a total of {len(all_items)} items from all {total_pages} pages")
+        return all_items
     except Exception as e:
         logging.error(f"Error fetching feed: {e}")
         logging.error(traceback.format_exc())
