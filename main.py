@@ -680,7 +680,8 @@ def run_all_tests():
         "environment_variables": test_environment_variables(),
         "storage_access": test_storage_access(),
         "woot_api": test_woot_api(),
-        "email": test_email()
+        "email": test_email(),
+        "api_structure": test_woot_api_structure()  # Add our new test
     }
     
     logging.info("====== TEST RESULTS SUMMARY ======")
@@ -703,6 +704,44 @@ def title_contains_keywords(title):
     
     title_lower = title.lower()
     return any(keyword.lower() in title_lower for keyword in KEYWORDS)
+
+def improved_title_contains_keywords(item):
+    """
+    Check if any relevant text fields in the item contain keywords.
+    This is used for pre-filtering to reduce API calls.
+    """
+    if not isinstance(item, dict):
+        return False
+    
+    # Check all these potential text fields
+    fields_to_check = [
+        "Title", "title",
+        "Description", "description",
+        "Subtitle", "subtitle",
+        "Snippet", "snippet", 
+        "Summary", "summary",
+        "Name", "name",
+        "ProductName", "productName"
+    ]
+    
+    # Log what we're checking
+    item_id = item.get("OfferId", item.get("Id", "unknown"))
+    logging.info(f"Checking item {item_id} for keywords")
+    
+    for field in fields_to_check:
+        value = item.get(field, "")
+        if value and isinstance(value, str):
+            value_lower = value.lower()
+            for keyword in KEYWORDS:
+                if keyword.lower() in value_lower:
+                    logging.info(f"✓ Found keyword '{keyword}' in field '{field}': '{value}'")
+                    return True
+    
+    # Log all available fields in the item for debugging
+    available_fields = [f"{k}: {type(v).__name__}" for k, v in item.items()]
+    logging.info(f"No keywords found in any checked fields. Available fields: {available_fields}")
+    
+    return False
 
 def check_woot_deals(request):
     """
@@ -730,6 +769,9 @@ def check_woot_deals(request):
         elif test_mode == "email":
             test_email()
             return "Email test completed. Check logs for results."
+        elif test_mode == "structure":  # Add new test option
+            test_woot_api_structure()
+            return "Woot API structure test completed. Check logs for results."
         elif test_mode == "all":
             run_all_tests()
             return "All diagnostic tests completed. Check logs for results."
@@ -775,11 +817,12 @@ def check_woot_deals(request):
             logging.info(f"Deal {offer_id} has been seen before, skipping")
             continue
         
-        # Check if title contains any keywords
-        title = item.get("Title", "")
-        if title_contains_keywords(title):
-            logging.info(f"Pre-filter match: '{title}' contains keywords")
+        # Use improved prefiltering that checks multiple fields
+        if improved_title_contains_keywords(item):
+            logging.info(f"Pre-filter match for item {offer_id}")
             potential_matches.append(offer_id)
+        else:
+            logging.info(f"No match for item {offer_id}")
     
     logging.info(f"Pre-filtered {len(feed_items)} items down to {len(potential_matches)} potential matches")
     
@@ -837,6 +880,106 @@ def check_woot_deals(request):
         result_message = "No new matching deals found."
         logging.info(result_message)
         return result_message
+    
+def test_woot_api_structure():
+    """Test the Woot API response structure and prefiltering logic."""
+    logging.info("=== TESTING WOOT API STRUCTURE AND PREFILTERING ===")
+    
+    if not WOOT_API_KEY:
+        logging.error("WOOT_API_KEY is not set")
+        return False
+    
+    headers = {
+        "x-api-key": WOOT_API_KEY,
+        "Accept": "application/json"
+    }
+    
+    try:
+        # Test the feed endpoint
+        logging.info(f"Testing connection to feed endpoint: {FEED_ENDPOINT}")
+        response = requests.get(FEED_ENDPOINT, headers=headers)
+        
+        if response.status_code == 200:
+            api_response = response.json()
+            logging.info(f"Successfully connected to feed endpoint. Received response data.")
+            
+            # Log the FULL raw response for analysis (careful with large responses)
+            logging.info("Full API response structure:")
+            logging.info(json.dumps(api_response, indent=2)[:5000] + "..." if len(json.dumps(api_response)) > 5000 else json.dumps(api_response, indent=2))
+            
+            # Analyze the response structure
+            if isinstance(api_response, list):
+                logging.info(f"API response is a LIST with {len(api_response)} items")
+                # Test prefiltering on list items
+                matching_items = 0
+                for i, item in enumerate(api_response[:20]):  # Check first 20 items
+                    if isinstance(item, dict):
+                        title = item.get("Title", "")
+                        logging.info(f"List item {i} title: '{title}'")
+                        if title_contains_keywords(title):
+                            matching_items += 1
+                            logging.info(f"✓ Title contains keywords: {title}")
+                            # Log the full item to see what else is available
+                            logging.info(f"Matching item structure: {json.dumps(item, indent=2)}")
+                        else:
+                            logging.info(f"✗ Title does NOT contain keywords: {title}")
+                
+                logging.info(f"Found {matching_items} matching items in first 20 items using title_contains_keywords()")
+                
+            elif isinstance(api_response, dict):
+                logging.info(f"API response is a DICTIONARY with keys: {list(api_response.keys())}")
+                
+                # Check for common container fields
+                items_field = None
+                items_data = None
+                
+                for potential_field in ["Items", "items", "products", "Products", "Deals", "deals", "results", "Results"]:
+                    if potential_field in api_response and isinstance(api_response[potential_field], list):
+                        items_field = potential_field
+                        items_data = api_response[potential_field]
+                        break
+                
+                if items_field:
+                    logging.info(f"Found items list in field '{items_field}' with {len(items_data)} items")
+                    
+                    # Test prefiltering on these items
+                    matching_items = 0
+                    for i, item in enumerate(items_data[:20]):  # Check first 20 items
+                        if isinstance(item, dict):
+                            title = item.get("Title", "")
+                            logging.info(f"{items_field} item {i} title: '{title}'")
+                            if title_contains_keywords(title):
+                                matching_items += 1
+                                logging.info(f"✓ Title contains keywords: {title}")
+                                # Log the full item to see what else is available
+                                logging.info(f"Matching item structure: {json.dumps(item, indent=2)}")
+                            else:
+                                logging.info(f"✗ Title does NOT contain keywords: {title}")
+                    
+                    logging.info(f"Found {matching_items} matching items in first 20 {items_field} using title_contains_keywords()")
+                else:
+                    logging.info(f"Could not find a list of items in the response dictionary")
+                    # Log all top-level fields
+                    for key, value in api_response.items():
+                        value_type = type(value).__name__
+                        preview = None
+                        if isinstance(value, (str, int, float, bool)):
+                            preview = str(value)
+                        elif isinstance(value, list):
+                            preview = f"List with {len(value)} items"
+                        elif isinstance(value, dict):
+                            preview = f"Dict with keys: {list(value.keys())}"
+                        logging.info(f"Field '{key}': {value_type} - {preview}")
+            
+            return True
+        else:
+            logging.error(f"Failed to connect to feed endpoint. Status code: {response.status_code}")
+            logging.error(f"Response: {response.text}")
+            return False
+    except Exception as e:
+        logging.error(f"Error testing Woot API structure: {e}")
+        logging.error(traceback.format_exc())
+        return False    
 
 # Add catch-all route handlers
 @app.route('/', defaults={'path': ''})
