@@ -9,7 +9,9 @@ import os
 from google.cloud import storage
 import sys
 import traceback
+import time
 from flask import Flask, request
+import random
 
 # Set up detailed logging
 logging.basicConfig(
@@ -31,6 +33,12 @@ EMAIL_RECIPIENT = os.environ.get("EMAIL_RECIPIENT")
 # GCS configuration
 BUCKET_NAME = os.environ.get("BUCKET_NAME")
 SEEN_DEALS_FILENAME = "seen_deals.json"
+
+# Rate limiting configuration
+MAX_RETRIES = 5
+INITIAL_RETRY_DELAY = 5  # seconds
+MAX_RETRY_DELAY = 60  # seconds
+BASE_DELAY_BETWEEN_BATCHES = 3  # seconds
 
 # Initialize storage client
 storage_client = None
@@ -434,15 +442,18 @@ def fetch_feed():
         return []
 
 def fetch_detailed_offers(offer_ids):
-    """Fetch detailed information for the specified offer IDs."""
+    """
+    Fetch detailed information for the specified offer IDs with retry logic.
+    Handles rate limiting with exponential backoff.
+    """
     if not offer_ids:
         logging.info("No offer IDs provided. Skipping detailed offers fetch.")
         return []
     
-    batch_size = 25
+    batch_size = 10  # Reduced from 25 to avoid rate limits
     all_detailed_offers = []
     
-    # Process in batches of 25 (API limit)
+    # Process in smaller batches with delays between them
     for i in range(0, len(offer_ids), batch_size):
         batch = offer_ids[i:i+batch_size]
         logging.info(f"Fetching details for batch {i//batch_size + 1}/{(len(offer_ids)+batch_size-1)//batch_size} with {len(batch)} offer IDs")
@@ -453,33 +464,86 @@ def fetch_detailed_offers(offer_ids):
             "Content-Type": "application/json"
         }
         
-        try:
-            logging.info(f"Making request to {GETOFFERS_ENDPOINT}")
-            logging.info(f"Request data: {json.dumps(batch)}")
-            
-            response = requests.post(
-                GETOFFERS_ENDPOINT, 
-                headers=headers, 
-                data=json.dumps(batch)
-            )
-            
-            logging.info(f"Received response with status code: {response.status_code}")
-            
-            if response.status_code != 200:
-                logging.error(f"Error response: {response.text}")
-                continue
+        # Add random jitter to delay to prevent synchronized requests
+        delay_with_jitter = BASE_DELAY_BETWEEN_BATCHES + random.uniform(0.5, 2.0)
+        
+        # Wait before making a request (except for the first batch)
+        if i > 0:
+            logging.info(f"Waiting {delay_with_jitter:.2f} seconds before next batch...")
+            time.sleep(delay_with_jitter)
+        
+        retry_count = 0
+        retry_delay = INITIAL_RETRY_DELAY
+        
+        while retry_count <= MAX_RETRIES:
+            try:
+                logging.info(f"Making request to {GETOFFERS_ENDPOINT}")
+                logging.info(f"Request data: {json.dumps(batch)}")
                 
-            response.raise_for_status()
-            detailed_offers = response.json()
-            
-            if isinstance(detailed_offers, list):
-                logging.info(f"Fetched {len(detailed_offers)} detailed offers from the API.")
-                all_detailed_offers.extend(detailed_offers)
-            else:
-                logging.warning(f"Detailed offers response is not a list: {type(detailed_offers)}")
-        except Exception as e:
-            logging.error(f"Error fetching detailed offers batch: {e}")
-            logging.error(traceback.format_exc())
+                response = requests.post(
+                    GETOFFERS_ENDPOINT, 
+                    headers=headers, 
+                    data=json.dumps(batch)
+                )
+                
+                logging.info(f"Received response with status code: {response.status_code}")
+                
+                # Success case
+                if response.status_code == 200:
+                    detailed_offers = response.json()
+                    
+                    if isinstance(detailed_offers, list):
+                        logging.info(f"Fetched {len(detailed_offers)} detailed offers from the API.")
+                        all_detailed_offers.extend(detailed_offers)
+                    else:
+                        logging.warning(f"Detailed offers response is not a list: {type(detailed_offers)}")
+                    
+                    # Success, exit the retry loop
+                    break
+                    
+                # Rate limiting case
+                elif response.status_code == 429:
+                    retry_count += 1
+                    
+                    if retry_count <= MAX_RETRIES:
+                        logging.warning(f"Rate limited (429). Retry {retry_count}/{MAX_RETRIES}. Waiting {retry_delay} seconds...")
+                        time.sleep(retry_delay)
+                        
+                        # Exponential backoff with jitter
+                        retry_delay = min(MAX_RETRY_DELAY, retry_delay * 2) + random.uniform(0, 1)
+                    else:
+                        logging.error(f"Max retries reached for batch. Moving to next batch.")
+                        break
+                
+                # Other error cases
+                else:
+                    logging.error(f"Error response: {response.text}")
+                    retry_count += 1
+                    
+                    if retry_count <= MAX_RETRIES:
+                        logging.warning(f"Error {response.status_code}. Retry {retry_count}/{MAX_RETRIES}. Waiting {retry_delay} seconds...")
+                        time.sleep(retry_delay)
+                        
+                        # Exponential backoff with jitter
+                        retry_delay = min(MAX_RETRY_DELAY, retry_delay * 2) + random.uniform(0, 1)
+                    else:
+                        logging.error(f"Max retries reached for batch. Moving to next batch.")
+                        break
+                        
+            except Exception as e:
+                logging.error(f"Error fetching detailed offers batch: {e}")
+                logging.error(traceback.format_exc())
+                
+                retry_count += 1
+                if retry_count <= MAX_RETRIES:
+                    logging.warning(f"Exception occurred. Retry {retry_count}/{MAX_RETRIES}. Waiting {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    
+                    # Exponential backoff with jitter
+                    retry_delay = min(MAX_RETRY_DELAY, retry_delay * 2) + random.uniform(0, 1)
+                else:
+                    logging.error(f"Max retries reached for batch. Moving to next batch.")
+                    break
     
     logging.info(f"Total detailed offers fetched: {len(all_detailed_offers)}")
     return all_detailed_offers
@@ -834,9 +898,9 @@ def check_woot_deals(request):
         logging.info("No potential matches found in pre-filtering. Exiting.")
         return "No matching deals found."
     
-    # Step 3: Process potential matches in batches of 25 (API limit)
+    # Step 3: Process potential matches with rate limiting awareness
     all_matching_deals = []
-    batch_size = 25
+    batch_size = 10  # Smaller batch size to avoid rate limits
     total_batches = (len(potential_matches) + batch_size - 1) // batch_size  # Ceiling division
     
     logging.info(f"Processing {len(potential_matches)} potential matches in {total_batches} batches of {batch_size}")
@@ -846,7 +910,13 @@ def check_woot_deals(request):
         batch = potential_matches[i:i+batch_size]
         logging.info(f"Processing batch {batch_num}/{total_batches} with {len(batch)} offers")
         
-        # Fetch detailed information for this batch
+        # Add delay between batches (except for the first one)
+        if i > 0:
+            delay = BASE_DELAY_BETWEEN_BATCHES + random.uniform(0.5, 2.0)
+            logging.info(f"Waiting {delay:.2f} seconds before processing next batch...")
+            time.sleep(delay)
+        
+        # Fetch detailed information for this batch (with retry logic built in)
         detailed_offers = fetch_detailed_offers(batch)
         
         # Step 4: Filter for new matching deals (full check with all fields)
