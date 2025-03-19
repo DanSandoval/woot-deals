@@ -529,32 +529,32 @@ def is_matching_deal(deal):
     logging.info(f"Checking if deal {deal_id} matches keywords")
     
     # Check title
-    title = deal.get("Title", "").lower()
-    if any(keyword.lower() in title for keyword in KEYWORDS):
+    title = deal.get("Title", "") or ""
+    if any(keyword.lower() in title.lower() for keyword in KEYWORDS):
         logging.info(f"Deal {deal_id} matches keywords in title: {title}")
         return True
     
     # Check description/writeup
-    writeup = deal.get("WriteUpBody", "").lower()
-    if any(keyword.lower() in writeup for keyword in KEYWORDS):
+    writeup = deal.get("WriteUpBody", "") or ""
+    if any(keyword.lower() in writeup.lower() for keyword in KEYWORDS):
         logging.info(f"Deal {deal_id} matches keywords in writeup")
         return True
     
     # Check features
-    features = deal.get("Features", "").lower()
-    if any(keyword.lower() in features for keyword in KEYWORDS):
+    features = deal.get("Features", "") or ""
+    if any(keyword.lower() in features.lower() for keyword in KEYWORDS):
         logging.info(f"Deal {deal_id} matches keywords in features")
         return True
         
     # Check subtitle if available
-    subtitle = deal.get("Subtitle", "").lower()
-    if any(keyword.lower() in subtitle for keyword in KEYWORDS):
+    subtitle = deal.get("Subtitle", "") or ""
+    if any(keyword.lower() in subtitle.lower() for keyword in KEYWORDS):
         logging.info(f"Deal {deal_id} matches keywords in subtitle")
         return True
     
     # Check snippet if available
-    snippet = deal.get("Snippet", "").lower()
-    if any(keyword.lower() in snippet for keyword in KEYWORDS):
+    snippet = deal.get("Snippet", "") or ""
+    if any(keyword.lower() in snippet.lower() for keyword in KEYWORDS):
         logging.info(f"Deal {deal_id} matches keywords in snippet")
         return True
         
@@ -584,15 +584,17 @@ def filter_deals(deals, seen_deals):
     logging.info(f"Found {len(new_matching_deals)} new matching deals.")
     return new_matching_deals
 
-def format_deal_email(deal):
-    """Format a deal for email notification."""
+def format_deal_notifications(deal):
+    """Format a deal for both email and text notifications."""
     deal_id = deal.get("Id", deal.get("OfferId", "unknown"))
-    logging.info(f"Formatting email for deal {deal_id}")
+    logging.info(f"Formatting notifications for deal {deal_id}")
     
     title = deal.get("Title", "No Title")
     url = deal.get("Url", "No URL")
     
     # Get price information - handle different possible structures
+    sale_price = None
+    list_price = None
     price_info = "Price unknown"
     
     # Try to get price from Items field
@@ -602,101 +604,110 @@ def format_deal_email(deal):
         list_price = items[0].get("ListPrice", None)
         
         if sale_price is not None:
-            savings = ""
-            if list_price is not None and isinstance(sale_price, (int, float)) and isinstance(list_price, (int, float)):
-                if list_price > sale_price:
-                    savings = f" (Save ${list_price - sale_price:.2f})"
-            price_info = f"${sale_price}{savings}"
+            price_info = f"${sale_price}"
     
     # Try SalePrice field directly on the deal
     elif "SalePrice" in deal:
-        sale_price = deal.get("SalePrice")
+        sale_price_data = deal.get("SalePrice")
         list_price = deal.get("ListPrice")
         
-        if isinstance(sale_price, list) and len(sale_price) > 0:
+        if isinstance(sale_price_data, list) and len(sale_price_data) > 0:
             # Handle price range format
-            min_price = sale_price[0].get("Minimum", None)
+            min_price = sale_price_data[0].get("Minimum", None)
             if min_price is not None:
+                sale_price = min_price
                 price_info = f"${min_price}"
-        elif sale_price is not None:
-            savings = ""
-            if list_price is not None and isinstance(sale_price, (int, float)) and isinstance(list_price, (int, float)):
-                if list_price > sale_price:
-                    savings = f" (Save ${list_price - sale_price:.2f})"
-            price_info = f"${sale_price}{savings}"
+        elif sale_price_data is not None:
+            sale_price = sale_price_data
+            price_info = f"${sale_price}"
     
-    # Extract a snippet from the description
-    description = deal.get("WriteUpIntro", "")
-    if not description:
-        description = deal.get("Snippet", "")
-    if not description:
-        description = deal.get("Subtitle", "")
+    # Format savings info if we have both prices
+    savings_info = ""
+    if sale_price is not None and list_price is not None:
+        if isinstance(sale_price, (int, float)) and isinstance(list_price, (int, float)):
+            if list_price > sale_price:
+                savings_info = f" (Save ${list_price - sale_price:.2f})"
     
-    if len(description) > 200:
-        description = description[:197] + "..."
+    # 1. Create short text message (<140 chars)
+    list_price_text = f" (Was ${list_price})" if list_price is not None else ""
+    text_message = f"{title[:70]}... {price_info}{list_price_text}"
     
-    # Format the email
+    # Ensure we're under 140 chars
+    if len(text_message) > 140:
+        # Truncate title further if needed
+        max_title_len = 70 - (len(text_message) - 140)
+        if max_title_len < 10:
+            max_title_len = 10
+        text_message = f"{title[:max_title_len]}... {price_info}{list_price_text}"
+    
+    # 2. Format the detailed email
     email_body = f"""
 <h2>{title}</h2>
-<p><strong>Price:</strong> {price_info}</p>
-<p>{description}</p>
-<p><a href="{url}">View on Woot!</a></p>
+<p><strong>Price:</strong> {price_info}{savings_info}</p>
+<p><strong>URL:</strong> <a href="{url}">{url}</a></p>
 <hr>
 <p><small>Sent by your Woot Deals alert system</small></p>
 """
-    logging.info(f"Email formatted for deal {deal_id}")
-    return title, email_body
+    
+    logging.info(f"Notifications formatted for deal {deal_id}")
+    return title, email_body, text_message
 
-def send_email(deals):
-    """Send an email notification for new deals."""
+def send_notifications(deals):
+    """Send email and text notifications for new deals."""
     if not deals:
-        logging.info("No deals to send email for. Skipping email notification.")
+        logging.info("No deals to send notifications for. Skipping.")
         return
         
-    logging.info(f"Preparing to send email for {len(deals)} deals")
+    logging.info(f"Preparing to send notifications for {len(deals)} deals")
     try:
-        # Create message container
-        msg = MIMEMultipart('alternative')
-        msg['Subject'] = f"Woot Alert: {len(deals)} new deal(s) matching your keywords"
-        msg['From'] = GMAIL_USER
-        msg['To'] = EMAIL_RECIPIENT
+        # Send text messages to the phone number
+        text_msg = MIMEMultipart('alternative')
+        text_msg['Subject'] = f"Woot Deal Alert"
+        text_msg['From'] = GMAIL_USER
+        text_msg['To'] = EMAIL_RECIPIENT  # This is the phone number email
         
-        logging.info(f"Email subject: {msg['Subject']}")
-        logging.info(f"Email from: {msg['From']}")
-        logging.info(f"Email to: {msg['To']}")
+        # Send detailed emails to the sender's address
+        email_msg = MIMEMultipart('alternative')
+        email_msg['Subject'] = f"Woot Alert: {len(deals)} new deal(s) matching your keywords"
+        email_msg['From'] = GMAIL_USER
+        email_msg['To'] = GMAIL_USER  # Send to yourself
         
-        # Create the body of the message
         text_parts = []
         html_parts = []
+        sms_parts = []
         
         for deal in deals:
-            title, html_content = format_deal_email(deal)
+            title, html_content, sms_content = format_deal_notifications(deal)
             text_parts.append(f"{title} - {deal.get('Url', 'No URL')}")
             html_parts.append(html_content)
+            sms_parts.append(sms_content)
         
+        # For SMS - use the short format
+        sms_content = "\n".join(sms_parts)
+        text_msg.attach(MIMEText(sms_content, 'plain'))
+        
+        # For email - use full HTML
         text_content = "\n\n".join(text_parts)
         html_content = "<html><body>" + "".join(html_parts) + "</body></html>"
+        email_msg.attach(MIMEText(text_content, 'plain'))
+        email_msg.attach(MIMEText(html_content, 'html'))
         
-        part1 = MIMEText(text_content, 'plain')
-        part2 = MIMEText(html_content, 'html')
-        
-        msg.attach(part1)
-        msg.attach(part2)
-        
-        logging.info("Email message prepared, attempting to send")
-        
-        # Send the message via Gmail SMTP
+        # Send both messages
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-            logging.info("Connected to SMTP server")
             server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-            logging.info("Logged in to SMTP server")
-            server.send_message(msg)
-            logging.info("Email sent successfully")
             
-        logging.info(f"Sent email notification for {len(deals)} deals.")
+            # Send text message first
+            server.send_message(text_msg)
+            logging.info("Text message sent successfully")
+            
+            # Send detailed email
+            server.send_message(email_msg)
+            logging.info("Email notification sent successfully")
+            
+        logging.info(f"Sent notifications for {len(deals)} deals")
         
     except Exception as e:
-        logging.error(f"Error sending email: {e}")
+        logging.error(f"Error sending notifications: {e}")
         logging.error(traceback.format_exc())
 
 def run_all_tests():
@@ -790,7 +801,7 @@ def check_woot_deals(request):
     # Step 4: Send email notifications if we found any deals
     if new_matching_deals:
         logging.info(f"Found {len(new_matching_deals)} new matching deals. Sending email notification.")
-        send_email(new_matching_deals)
+        send_notifications(new_matching_deals)
         
         # Add to seen deals
         for deal in new_matching_deals:
