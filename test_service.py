@@ -6,7 +6,7 @@ import sys
 def main():
     parser = argparse.ArgumentParser(description='Test the Woot Deals service')
     parser.add_argument('--url', type=str, required=True, help='URL of the Cloud Run service')
-    parser.add_argument('--test', type=str, choices=['env', 'storage', 'api', 'email', 'all', 'normal'], 
+    parser.add_argument('--test', type=str, choices=['env', 'storage', 'api', 'email', 'structure', 'all', 'normal'], 
                         default='all', help='Test mode to run')
     
     args = parser.parse_args()
