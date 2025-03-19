@@ -476,9 +476,10 @@ def fetch_detailed_offers(offer_ids):
         logging.info("No offer IDs provided. Skipping detailed offers fetch.")
         return []
     
-    # Limit to 25 offers per request, as per API limits
-    offer_ids = offer_ids[:25]
-    logging.info(f"Fetching detailed information for {len(offer_ids)} offer IDs")
+    # Process the batch of offer IDs (25 at a time is the API limit)
+    batch_size = 25
+    batch_ids = offer_ids[:batch_size]
+    logging.info(f"Fetching detailed information for {len(batch_ids)} offer IDs")
     
     headers = {
         "x-api-key": WOOT_API_KEY,
@@ -488,12 +489,12 @@ def fetch_detailed_offers(offer_ids):
     
     try:
         logging.info(f"Making request to {GETOFFERS_ENDPOINT}")
-        logging.info(f"Request data: {json.dumps(offer_ids)}")
+        logging.info(f"Request data: {json.dumps(batch_ids)}")
         
         response = requests.post(
             GETOFFERS_ENDPOINT, 
             headers=headers, 
-            data=json.dumps(offer_ids)
+            data=json.dumps(batch_ids)
         )
         
         logging.info(f"Received response with status code: {response.status_code}")
@@ -731,6 +732,17 @@ def run_all_tests():
     logging.info(f"Overall test result: {'PASS' if all_passed else 'FAIL'}")
     return results
 
+def title_contains_keywords(title):
+    """
+    Check if the title contains any of our keywords.
+    This is used for pre-filtering to reduce API calls.
+    """
+    if not title:
+        return False
+    
+    title_lower = title.lower()
+    return any(keyword.lower() in title_lower for keyword in KEYWORDS)
+
 def check_woot_deals(request):
     """
     Main function to check for Woot deals.
@@ -778,43 +790,89 @@ def check_woot_deals(request):
     if not feed_items:
         logging.info("No feed items found. Exiting.")
         return "No feed items found"
-        
-    # Extract offer IDs for fetching detailed information
-    offer_ids = []
+    
+    # Step 2: Pre-filter feed items by title to reduce API calls
+    potential_matches = []
+    all_offer_ids = []  # Track all offers for seen deals list
+    
     for item in feed_items:
+        # Get the ID for tracking
+        offer_id = None
         if "OfferId" in item:
-            offer_ids.append(item["OfferId"])
+            offer_id = item["OfferId"]
         elif "Id" in item:
-            offer_ids.append(item["Id"])
-    
-    logging.info(f"Extracted {len(offer_ids)} offer IDs from feed items")
-    
-    # Step 2: Fetch detailed information for these offers
-    detailed_offers = fetch_detailed_offers(offer_ids)
-    
-    # Use detailed offers if available, otherwise use feed items
-    items_to_check = detailed_offers if detailed_offers else feed_items
-    
-    # Step 3: Filter for new matching deals
-    new_matching_deals = filter_deals(items_to_check, seen_deals)
-    
-    # Step 4: Send email notifications if we found any deals
-    if new_matching_deals:
-        logging.info(f"Found {len(new_matching_deals)} new matching deals. Sending email notification.")
-        send_notifications(new_matching_deals)
+            offer_id = item["Id"]
         
-        # Add to seen deals
-        for deal in new_matching_deals:
-            unique_id = deal.get("Id", deal.get("OfferId"))
-            if unique_id:
-                seen_deals.append(unique_id)
+        if not offer_id:
+            continue
             
-        # Save updated seen deals
+        # Add to all offers list
+        all_offer_ids.append(offer_id)
+        
+        # Skip if already seen
+        if offer_id in seen_deals:
+            logging.info(f"Deal {offer_id} has been seen before, skipping")
+            continue
+        
+        # Check if title contains any keywords
+        title = item.get("Title", "")
+        if title_contains_keywords(title):
+            logging.info(f"Pre-filter match: '{title}' contains keywords")
+            potential_matches.append(offer_id)
+    
+    logging.info(f"Pre-filtered {len(feed_items)} items down to {len(potential_matches)} potential matches")
+    
+    # If no potential matches from title screening, we're done
+    if not potential_matches:
+        # Add all offer IDs to seen deals to avoid checking them again
+        seen_deals.extend(all_offer_ids)
         save_seen_deals(seen_deals)
-        result_message = f"Found and notified about {len(new_matching_deals)} new deals"
+        
+        logging.info("No potential matches found in pre-filtering. Exiting.")
+        return "No matching deals found."
+    
+    # Step 3: Process potential matches in batches of 25 (API limit)
+    all_matching_deals = []
+    batch_size = 25
+    total_batches = (len(potential_matches) + batch_size - 1) // batch_size  # Ceiling division
+    
+    logging.info(f"Processing {len(potential_matches)} potential matches in {total_batches} batches of {batch_size}")
+    
+    for i in range(0, len(potential_matches), batch_size):
+        batch_num = i // batch_size + 1
+        batch = potential_matches[i:i+batch_size]
+        logging.info(f"Processing batch {batch_num}/{total_batches} with {len(batch)} offers")
+        
+        # Fetch detailed information for this batch
+        detailed_offers = fetch_detailed_offers(batch)
+        
+        # Filter for new matching deals (full check with all fields)
+        batch_matching_deals = filter_deals(detailed_offers, seen_deals)
+        
+        # Add new matches to our results list
+        all_matching_deals.extend(batch_matching_deals)
+        
+        # Add processed IDs to seen deals
+        for deal in detailed_offers:
+            unique_id = deal.get("Id", deal.get("OfferId"))
+            if unique_id and unique_id not in seen_deals:
+                seen_deals.append(unique_id)
+    
+    # Step 4: Send notifications if we found any matching deals
+    if all_matching_deals:
+        logging.info(f"Found a total of {len(all_matching_deals)} new matching deals. Sending notifications.")
+        send_notifications(all_matching_deals)
+        
+        # Save updated seen deals (includes all IDs we've processed)
+        save_seen_deals(seen_deals)
+        result_message = f"Found and notified about {len(all_matching_deals)} new deals"
         logging.info(result_message)
         return result_message
     else:
+        # Add all offer IDs to seen deals to avoid checking them again
+        seen_deals.extend([id for id in all_offer_ids if id not in seen_deals])
+        save_seen_deals(seen_deals)
+        
         result_message = "No new matching deals found."
         logging.info(result_message)
         return result_message
