@@ -805,7 +805,6 @@ def improved_title_contains_keywords(item):
     logging.debug(f"No keywords found in any checked fields for item {item_id}")
     return False
 
-# Update the prefiltering section in check_woot_deals function
 def check_woot_deals(request):
     """
     Main function to check for Woot deals.
@@ -902,6 +901,7 @@ def check_woot_deals(request):
     all_matching_deals = []
     batch_size = 10  # Smaller batch size to avoid rate limits
     total_batches = (len(potential_matches) + batch_size - 1) // batch_size  # Ceiling division
+    processed_deal_ids = []  # NEW: Track all processed deals separately from seen_deals
     
     logging.info(f"Processing {len(potential_matches)} potential matches in {total_batches} batches of {batch_size}")
     
@@ -925,25 +925,54 @@ def check_woot_deals(request):
         # Add new matches to our results list
         all_matching_deals.extend(batch_matching_deals)
         
-        # Add processed IDs to seen deals
+        # NEW: Track processed IDs but don't add to seen_deals yet
         for deal in detailed_offers:
             unique_id = deal.get("Id", deal.get("OfferId"))
-            if unique_id and unique_id not in seen_deals:
-                seen_deals.append(unique_id)
+            if unique_id and unique_id not in processed_deal_ids:
+                processed_deal_ids.append(unique_id)
     
     # Send notifications if we found any matching deals
     if all_matching_deals:
         logging.info(f"Found a total of {len(all_matching_deals)} new matching deals. Sending notifications.")
-        send_notifications(all_matching_deals)
-        
-        # Save updated seen deals (includes all IDs we've processed)
-        save_seen_deals(seen_deals)
-        result_message = f"Found and notified about {len(all_matching_deals)} new deals"
-        logging.info(result_message)
-        return result_message
+        try:
+            # Attempt to send notifications
+            send_notifications(all_matching_deals)
+            
+            # Only NOW add the deals to the seen list - AFTER successful notification
+            # Add matching deals to seen_deals
+            for deal in all_matching_deals:
+                unique_id = deal.get("Id", deal.get("OfferId"))
+                if unique_id and unique_id not in seen_deals:
+                    seen_deals.append(unique_id)
+            
+            # NEW: Add remaining processed deals (non-matching deals) to seen_deals
+            for deal_id in processed_deal_ids:
+                if deal_id not in seen_deals:
+                    seen_deals.append(deal_id)
+            
+            # Save updated seen deals list
+            save_seen_deals(seen_deals)
+            
+            result_message = f"Found and notified about {len(all_matching_deals)} new deals"
+            logging.info(result_message)
+            return result_message
+            
+        except Exception as e:
+            # If notification fails, don't mark deals as seen
+            logging.error(f"Failed to send notifications: {e}")
+            logging.error(traceback.format_exc())
+            return f"Error sending notifications: {e}"
     else:
-        # Add all offer IDs to seen deals to avoid checking them again
-        seen_deals.extend([id for id in all_offer_ids if id not in seen_deals])
+        # No matching deals found, but still mark processed IDs as seen
+        for deal_id in processed_deal_ids:
+            if deal_id not in seen_deals:
+                seen_deals.append(deal_id)
+        
+        # Also mark any remaining IDs from all_offer_ids as seen
+        for deal_id in all_offer_ids:
+            if deal_id not in seen_deals:
+                seen_deals.append(deal_id)
+        
         save_seen_deals(seen_deals)
         
         result_message = "No new matching deals found."
@@ -1040,7 +1069,7 @@ def test_woot_api_structure():
                                     for keyword in KEYWORDS:
                                         if keyword.lower() in item[field].lower():
                                             preview = item[field][:50] + "..." if len(item[field]) > 50 else item[field]
-                                            logging.info(f"Keyword '{keyword}' found in field '{field}': {preview}")
+                                            logging.info(f"Keyword '{keyword}' found in field '{field}': '{preview}'")
                 
                 logging.info(f"Found {total_matches} matching items out of {checked_items} checked items using improved_title_contains_keywords()")
             
