@@ -23,7 +23,7 @@ logging.basicConfig(
 WOOT_API_KEY = os.environ.get("WOOT_API_KEY")
 FEED_ENDPOINT = "https://developer.woot.com/feed/All"  # Changed to All to search everything
 GETOFFERS_ENDPOINT = "https://developer.woot.com/getoffers"
-KEYWORDS = ["kindle", "ereader", "e-reader", "e-ink", "kobo", "nook", "eink", "treadmill", "walking pad", "iphone", "apple"]
+KEYWORDS = ["kindle", "ereader", "e-reader", "e-ink", "kobo", "nook", "eink", "treadmill", "walking pad"]
 
 # Gmail configuration
 GMAIL_USER = os.environ.get("GMAIL_USER")
@@ -708,8 +708,27 @@ def send_notifications(deals):
             html_parts.append(html_content)
             sms_parts.append(sms_content)
         
-        # For SMS - use the short format
-        sms_content = "\n".join(sms_parts)
+        # For SMS - use a simple summary format instead of listing each deal
+        # Find which keywords matched
+        matched_keywords = set()
+        for deal in deals:
+            for keyword in KEYWORDS:
+                if (keyword.lower() in deal.get("Title", "").lower() or 
+                    keyword.lower() in deal.get("WriteUpBody", "").lower() or
+                    keyword.lower() in deal.get("Features", "").lower() or
+                    keyword.lower() in deal.get("Subtitle", "").lower() or
+                    keyword.lower() in deal.get("Snippet", "").lower()):
+                    matched_keywords.add(keyword)
+        
+        # Create a comma-separated list of matched keywords
+        keywords_str = ", ".join(matched_keywords)
+        # Truncate if too long
+        if len(keywords_str) > 50:
+            keywords_str = keywords_str[:47] + "..."
+        
+        # Create the summary message
+        sms_content = f"({len(deals)}) deals found for keywords: {keywords_str}"
+        logging.info(f"SMS summary: {sms_content}")
         text_msg.attach(MIMEText(sms_content, 'plain'))
         
         # For email - use full HTML
