@@ -23,7 +23,7 @@ logging.basicConfig(
 WOOT_API_KEY = os.environ.get("WOOT_API_KEY")
 FEED_ENDPOINT = "https://developer.woot.com/feed/All"  # Changed to All to search everything
 GETOFFERS_ENDPOINT = "https://developer.woot.com/getoffers"
-KEYWORDS = ["kindle", "ereader", "e-reader", "e-ink", "kobo", "nook", "eink", "treadmill"]
+KEYWORDS = ["kindle", "ereader", "e-reader", "e-ink", "kobo", "nook", "eink"]
 
 
 def normalize_text(text):

@@ -34,7 +34,7 @@ def make_item(index):
     if index == 4200:
         title, slug = "Kindle Paperwhite 16GB", "kindle-paperwhite-16gb"
     elif index == 4300:
-        title, slug = "Folding Treadmill 2.5HP", "folding-treadmill-25hp"
+        title, slug = "Kobo Clara HD", "kobo-clara-hd-ereader"
     elif index == 12:
         title, slug = "Refurb E-Reader Bundle", "refurb-e-reader-bundle"
     else:
@@ -206,8 +206,9 @@ class PipelineTest(PipelineTestBase):
     def test_normalization_matches_hyphen_and_space_forms(self):
         self.assertEqual(main.matched_keywords("Kindle Paperwhite"), ["kindle"])
         self.assertEqual(main.matched_keywords("An E-Reader"), ["e-reader"])
-        # "walking pad" is no longer a keyword, but hyphen flattening still applies.
-        self.assertEqual(main.matched_keywords("walking-pad-treadmill"), ["treadmill"])
+        # Hyphen flattening lets a slug match the same as prose.
+        self.assertEqual(main.matched_keywords("kobo-clara-hd-ereader"),
+                         ["ereader", "kobo"])
         self.assertEqual(main.matched_keywords(None), [])
         self.assertEqual(main.matched_keywords(123), [])
 
@@ -350,8 +351,8 @@ class PipelineTest(PipelineTestBase):
 
         self.assertEqual(len(self.sent), 1)
         titles = sorted(d["Title"] for d in self.sent[0])
-        self.assertEqual(titles, ["Folding Treadmill 2.5HP",
-                                  "Kindle Paperwhite 16GB",
+        self.assertEqual(titles, ["Kindle Paperwhite 16GB",
+                                  "Kobo Clara HD",
                                   "Refurb E-Reader Bundle"])
         self.assertIn("complete=True", result)
 
