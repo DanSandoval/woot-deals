@@ -4,7 +4,7 @@ import logging
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import os
 from google.cloud import storage
 import sys
@@ -23,7 +23,23 @@ logging.basicConfig(
 WOOT_API_KEY = os.environ.get("WOOT_API_KEY")
 FEED_ENDPOINT = "https://developer.woot.com/feed/All"  # Changed to All to search everything
 GETOFFERS_ENDPOINT = "https://developer.woot.com/getoffers"
-KEYWORDS = ["kindle", "ereader", "e-reader", "e-ink", "kobo", "nook", "eink", "treadmill", "walking pad"]
+KEYWORDS = ["kindle", "ereader", "e-reader", "e-ink", "kobo", "nook", "eink", "treadmill"]
+
+
+def normalize_text(text):
+    """Lowercase and flatten hyphens so "e-reader", "e reader" and slug text all match."""
+    return text.replace("-", " ").lower()
+
+
+NORMALIZED_KEYWORDS = [normalize_text(k) for k in KEYWORDS]
+
+
+def matched_keywords(text):
+    """Return the keywords present in a piece of text (empty when text is missing or not a string)."""
+    if not isinstance(text, str) or not text:
+        return []
+    haystack = normalize_text(text)
+    return [KEYWORDS[i] for i, k in enumerate(NORMALIZED_KEYWORDS) if k in haystack]
 
 # Gmail configuration
 GMAIL_USER = os.environ.get("GMAIL_USER")
@@ -38,7 +54,86 @@ SEEN_DEALS_FILENAME = "seen_deals.json"
 MAX_RETRIES = 5
 INITIAL_RETRY_DELAY = 5  # seconds
 MAX_RETRY_DELAY = 60  # seconds
-BASE_DELAY_BETWEEN_BATCHES = 3  # seconds
+REQUEST_TIMEOUT = 30  # seconds
+
+# The Woot API rate limits like a token bucket: a small burst, then roughly one
+# request per second. Every call goes through _throttle() so feed pagination and
+# getoffers batches draw on one shared pacer instead of racing each other.
+MIN_REQUEST_INTERVAL = 1.25  # seconds between any two Woot API requests
+DETAIL_BATCH_SIZE = 10  # offer IDs per getoffers call
+
+# Cloud Scheduler gives this service a limited attempt deadline. Staying inside
+# it matters: an overrunning request gets retried by the scheduler, which would
+# only burn more rate-limit budget.
+RUN_BUDGET_SECONDS = 150
+FEED_BUDGET_RESERVE = 45  # keep this much of the budget for the detail fetch
+MAX_FEED_PAGES = 200  # guard against a runaway TotalPages value
+
+# An offer that has not appeared in the feed for this long is dropped from the
+# seen-deals index, which bounds the state file instead of growing it forever.
+SEEN_DEALS_RETENTION_DAYS = 45
+
+# --- Health monitoring -------------------------------------------------------
+# This service failed silently for months: it kept returning HTTP 200 and kept
+# reporting "0 matches" while only reading a quarter of the feed. Everything
+# below exists so that cannot happen again without someone being told.
+HEALTH_STATE_FILENAME = "health_state.json"
+
+# Every run emits one machine-readable summary line starting with this marker.
+# Cloud Monitoring alerts on it: a log-based metric counts status=failed/degraded,
+# and an absence policy fires when no status=ok line appears for a few hours,
+# which is the only way to catch the service not running at all.
+HEALTH_MARKER = "WOOT_HEALTH"
+
+# A healthy feed is ~5000 items over 50 pages. The floor has to sit ABOVE the
+# failure it exists to catch: the original truncation returned ~1300 items, so a
+# floor of 1000 would have sat silently through the very bug it was added for.
+FEED_SIZE_FLOOR = 3000
+
+# A drop against the recent norm catches a shrink that never crosses the floor.
+# The baseline is the median of recent healthy runs, not the largest ever seen: a
+# high-water mark only ratchets up, so one anomalous run raises the bar forever,
+# and a feed that silently serves page 1 fifty times would inflate it and then
+# make the eventual fix look like a regression.
+FEED_SHRINK_RATIO = 0.70
+FEED_BASELINE_RUNS = 24        # ~1 day of hourly runs
+FEED_BASELINE_MIN_SAMPLES = 6  # below this the ratio check is not evaluated
+
+# Contract checks on the feed's shape. These catch the case where every pipe
+# works and the content is wrong -- the class the original bug belonged to.
+FEED_MIN_TITLE_RATIO = 0.95     # feed items carrying usable title text
+FEED_MAX_DUPLICATE_RATIO = 0.05 # duplicate offer ids; should be ~0
+
+# The seen-index should sit near the live catalogue size plus recent churn.
+SEEN_STATE_MIN = 500
+SEEN_STATE_MAX = 90000
+
+# Warn while there is still headroom, rather than after the budget binds.
+RUN_DURATION_WARN_RATIO = 0.87
+FEED_PAGES_WARN = 65  # at ~1.25s/page the budget supports ~84
+
+# A term Woot always has live, matched against feed text we have already
+# fetched. It exercises the real matching pipeline every hour with a
+# guaranteed-positive case, so a broken matcher shows up in hours rather than
+# whenever a Kindle next happens to go on sale.
+# OBSERVE ONLY: recorded in the health line, not alerted on, until a week of
+# data confirms it is genuinely present in every run. See README.
+CANARY_KEYWORD = "refurbished"
+
+# Do not text the user hourly about a failure they already know about: alert on
+# the transition into a problem, then at most once per cooldown while it lasts.
+ALERT_COOLDOWN_HOURS = 12
+
+# Woot's catalogue turns over daily, so a full day of hourly runs seeing nothing
+# new means the feed is stale or the seen-index is wrong -- the pipeline looking
+# alive while no longer actually observing anything, which is how the original
+# bug presented. A single run with no new offers is perfectly normal.
+NO_NEW_ITEMS_RUNS = 24
+
+# Backstops against a bug in the alerter itself: never let one logic error turn
+# into unbounded texts.
+MAX_REPEAT_ALERTS_PER_INCIDENT = 4
+MAX_ALERTS_PER_DAY = 4
 
 # Initialize storage client
 storage_client = None
@@ -51,6 +146,20 @@ except Exception as e:
 
 # Create Flask app
 app = Flask(__name__)
+
+# Shared request pacing and per-run budget state
+_last_request_time = 0.0
+_run_deadline = None
+
+# Problems recorded during the current run, drained by report_run_health()
+_health_events = []
+
+# Observations about the current run's feed fetch, for the health checks
+_feed_stats = {}
+
+# Whether this run already spent its Woot API budget on the feed. A retry after
+# that point costs another full pagination, so a late crash must not ask for one.
+_feed_was_fetched = False
 
 def test_environment_variables():
     """Test if all required environment variables are set."""
@@ -331,40 +440,88 @@ def test_email():
         return False
 
 def load_seen_deals():
-    """Load seen deals from Cloud Storage."""
-    logging.info("Attempting to load seen deals from Cloud Storage")
+    """
+    Load the seen-deal index from Cloud Storage.
+
+    Returns {offer_id: last_seen_iso}, or None if the state could not be read.
+    None is deliberately distinct from an empty index: treating a read failure as
+    "nothing seen yet" would re-notify about every live deal on Woot. Older
+    revisions stored a plain list; that format is accepted and upgraded on save.
+    """
+    logging.info("Loading seen deals from Cloud Storage")
     try:
         if not storage_client:
             logging.error("Storage client not initialized")
-            return []
-            
+            return None
+
         bucket = storage_client.bucket(BUCKET_NAME)
         blob = bucket.blob(SEEN_DEALS_FILENAME)
-        
+
         if not blob.exists():
-            logging.info(f"Seen deals file '{SEEN_DEALS_FILENAME}' does not exist in bucket '{BUCKET_NAME}'. Returning empty list.")
-            return []
-            
-        seen_deals_content = blob.download_as_text()
-        seen_deals = json.loads(seen_deals_content)
+            logging.info(
+                f"'{SEEN_DEALS_FILENAME}' does not exist in bucket '{BUCKET_NAME}'. Starting empty."
+            )
+            return {}
+
+        payload = json.loads(blob.download_as_text())
+
+        if isinstance(payload, list):
+            # The legacy format carried no timestamps. Stamp them now so retention
+            # has a baseline; anything still live is refreshed by this run anyway.
+            now = datetime.now(timezone.utc).isoformat()
+            seen_deals = {str(deal_id): now for deal_id in payload if deal_id}
+            logging.info(f"Upgraded {len(seen_deals)} seen deals from the legacy list format")
+        elif isinstance(payload, dict):
+            deals = payload.get("deals", payload)
+            if not isinstance(deals, dict):
+                logging.error("Seen-deals payload has no usable 'deals' mapping")
+                return None
+            seen_deals = {str(k): v for k, v in deals.items()}
+        else:
+            logging.error(f"Unexpected seen-deals payload type: {type(payload).__name__}")
+            return None
+
         logging.info(f"Loaded {len(seen_deals)} seen deals from Cloud Storage")
         return seen_deals
     except Exception as e:
         logging.error(f"Error loading seen deals: {e}")
         logging.error(traceback.format_exc())
-        return []
+        return None
+
+
+def prune_seen_deals(seen_deals):
+    """Drop offers absent from the feed for SEEN_DEALS_RETENTION_DAYS, bounding the state file."""
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=SEEN_DEALS_RETENTION_DAYS)
+    ).isoformat()
+    kept = {
+        deal_id: last_seen
+        for deal_id, last_seen in seen_deals.items()
+        if not isinstance(last_seen, str) or last_seen >= cutoff
+    }
+    dropped = len(seen_deals) - len(kept)
+    if dropped:
+        logging.info(f"Pruned {dropped} seen deals older than {SEEN_DEALS_RETENTION_DAYS} days")
+    return kept
 
 def save_seen_deals(seen_deals):
-    """Save seen deals to Cloud Storage."""
+    """Save the seen-deal index to Cloud Storage."""
     logging.info(f"Attempting to save {len(seen_deals)} seen deals to Cloud Storage")
     try:
         if not storage_client:
             logging.error("Storage client not initialized")
             return False
-            
+
         bucket = storage_client.bucket(BUCKET_NAME)
         blob = bucket.blob(SEEN_DEALS_FILENAME)
-        blob.upload_from_string(json.dumps(seen_deals))
+        # JSON has no non-string keys, so normalise on the way out to match what
+        # load_seen_deals() reads back. Otherwise a non-string ID would miss the
+        # seen check on every run and re-alert every hour.
+        blob.upload_from_string(
+            json.dumps({"version": 2,
+                        "deals": {str(k): v for k, v in seen_deals.items()}}),
+            content_type="application/json",
+        )
         logging.info(f"Saved {len(seen_deals)} seen deals to Cloud Storage")
         return True
     except Exception as e:
@@ -372,241 +529,602 @@ def save_seen_deals(seen_deals):
         logging.error(traceback.format_exc())
         return False
 
+def record_health_event(kind, detail=""):
+    """
+    Note a problem for this run's health report.
+
+    Anything recorded here reaches the user: it lands in the run's summary line
+    (which Cloud Monitoring alerts on) and, if it is severe, in an alert email
+    and text.
+    """
+    _health_events.append({"kind": kind, "detail": str(detail)[:300]})
+    logging.error(f"{HEALTH_MARKER}_EVENT kind={kind} detail={detail}")
+
+
+def reset_health_events():
+    """Clear recorded problems at the start of a run."""
+    del _health_events[:]
+
+
+def load_health_state():
+    """Load the cross-run health record. Returns {} when unavailable."""
+    try:
+        if not storage_client:
+            return {}
+        blob = storage_client.bucket(BUCKET_NAME).blob(HEALTH_STATE_FILENAME)
+        if not blob.exists():
+            return {}
+        state = json.loads(blob.download_as_text())
+        return state if isinstance(state, dict) else {}
+    except Exception as e:
+        # Never let health bookkeeping break the actual job.
+        logging.warning(f"Could not read health state: {e}")
+        return {}
+
+
+def save_health_state(state):
+    """Persist the cross-run health record. Best effort."""
+    try:
+        if not storage_client:
+            return False
+        blob = storage_client.bucket(BUCKET_NAME).blob(HEALTH_STATE_FILENAME)
+        blob.upload_from_string(json.dumps(state), content_type="application/json")
+        return True
+    except Exception as e:
+        logging.warning(f"Could not write health state: {e}")
+        return False
+
+
+def send_alert(subject, body):
+    """
+    Send a health alert over the same channels as deal alerts.
+
+    Returns False if it could not be sent -- which is precisely the case the
+    external Cloud Monitoring alert exists to cover, since a broken mail path
+    cannot report that it is broken.
+    """
+    if not (GMAIL_USER and GMAIL_APP_PASSWORD and EMAIL_RECIPIENT):
+        logging.error("Cannot send health alert: mail settings are not configured")
+        return False
+
+    try:
+        sms = MIMEMultipart('alternative')
+        sms['Subject'] = "Woot tracker problem"
+        sms['From'] = GMAIL_USER
+        sms['To'] = EMAIL_RECIPIENT
+        sms.attach(MIMEText(subject[:140], 'plain'))
+
+        email = MIMEMultipart('alternative')
+        email['Subject'] = f"Woot tracker: {subject}"
+        email['From'] = GMAIL_USER
+        email['To'] = GMAIL_USER
+        email.attach(MIMEText(body, 'plain'))
+
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+            server.send_message(sms)
+            server.send_message(email)
+
+        logging.info(f"Health alert sent: {subject}")
+        return True
+    except Exception as e:
+        logging.error(f"Could not send health alert: {e}")
+        logging.error(traceback.format_exc())
+        return False
+
+
+def _recent_alert_count(state, now):
+    """How many alerts went out in the last 24 hours."""
+    fresh = []
+    for stamp in state.get("alert_log", []):
+        try:
+            if now - datetime.fromisoformat(stamp) < timedelta(hours=24):
+                fresh.append(stamp)
+        except (TypeError, ValueError):
+            continue
+    return fresh
+
+
+def _should_alert(state, status, signature, now):
+    """
+    Decide whether this problem warrants waking the user.
+
+    Alerts fire on the transition into a problem, then at most once per
+    ALERT_COOLDOWN_HOURS while the same problem persists, capped per incident and
+    per day. The caps are the backstop against a bug in this logic itself: one
+    mistake here must not become unbounded texts at 3am.
+    """
+    if status == "ok":
+        return False
+
+    if len(_recent_alert_count(state, now)) >= MAX_ALERTS_PER_DAY:
+        logging.error(
+            f"{HEALTH_MARKER}_ALERT_SUPPRESSED reason=daily_cap signature={signature}"
+        )
+        return False
+
+    if state.get("last_alert_signature") != signature:
+        return True  # a different problem always gets through
+
+    if int(state.get("incident_alert_count", 0)) >= MAX_REPEAT_ALERTS_PER_INCIDENT:
+        logging.error(
+            f"{HEALTH_MARKER}_ALERT_SUPPRESSED reason=incident_cap signature={signature}"
+        )
+        return False
+
+    last_sent = state.get("last_alert_sent")
+    if not last_sent:
+        return True
+
+    try:
+        elapsed = now - datetime.fromisoformat(last_sent)
+    except (TypeError, ValueError):
+        return True
+
+    return elapsed >= timedelta(hours=ALERT_COOLDOWN_HOURS)
+
+
+def report_run_health(status, metrics):
+    """
+    Emit this run's health summary, alert the user if warranted, and persist the
+    cross-run record.
+
+    `status` is "ok", "degraded" (ran, but the results cannot be trusted) or
+    "failed" (did not run). Returns the status actually reported.
+
+    Never raises: monitoring must not be able to break the job it monitors.
+    """
+    try:
+        return _report_run_health(status, metrics)
+    except Exception as e:
+        logging.error(f"Health reporting itself failed: {e}")
+        logging.error(traceback.format_exc())
+        logging.error(f"{HEALTH_MARKER} status={status} problems=health_reporting_broken")
+        return status
+
+
+def _apply_staleness_check(status, kinds, state, metrics):
+    """
+    Flag a feed that has stopped changing.
+
+    A single run with no new offers is normal; a full day of them means the feed
+    is stale or the seen-index is wrong -- the pipeline looking alive while no
+    longer actually observing anything.
+    """
+    if status != "ok" or "new_items" not in metrics:
+        return status, kinds, state
+
+    if int(metrics["new_items"]) != 0:
+        state["consecutive_no_new_runs"] = 0
+        return status, kinds, state
+
+    stale_runs = int(state.get("consecutive_no_new_runs", 0)) + 1
+    state["consecutive_no_new_runs"] = stale_runs
+    if stale_runs < NO_NEW_ITEMS_RUNS:
+        return status, kinds, state
+
+    record_health_event(
+        "feed_not_changing",
+        f"no new offers across {stale_runs} consecutive runs; "
+        f"the feed may be stale or the seen-index wrong"
+    )
+    kinds = sorted(set(kinds) - {"none"} | {"feed_not_changing"})
+    return "degraded", kinds, state
+
+
+def _report_run_health(status, metrics):
+    now = datetime.now(timezone.utc)
+    state = load_health_state()
+
+    events = list(_health_events)
+    if events and status == "ok":
+        status = "degraded"
+
+    kinds = sorted({e["kind"] for e in events}) or (["none"] if status == "ok" else ["unknown"])
+
+    status, kinds, state = _apply_staleness_check(status, kinds, state, metrics)
+
+    # One machine-readable line per run. Cloud Monitoring keys off this: a metric
+    # counts status=failed/degraded, and an absence policy fires when no
+    # status=ok appears for hours -- the only way to detect the service not
+    # running at all, which nothing inside the run can notice.
+    detail = " ".join(f"{k}={v}" for k, v in sorted(metrics.items()))
+    summary = f"{HEALTH_MARKER} status={status} problems={','.join(kinds)} {detail}"
+    if status == "ok":
+        logging.info(summary)
+    else:
+        logging.error(summary)
+
+    # Track consecutive failures and the last genuinely good run.
+    if status == "ok":
+        state["last_success"] = now.isoformat()
+        state["consecutive_bad_runs"] = 0
+    else:
+        state["consecutive_bad_runs"] = int(state.get("consecutive_bad_runs", 0)) + 1
+
+    # Only a fully healthy, complete run may move the baseline. A baseline fed by
+    # truncated runs drifts down to meet the failure and disarms the check.
+    if status == "ok" and metrics.get("feed_complete") == "true" and metrics.get("feed_items"):
+        sizes = [s for s in state.get("recent_feed_sizes", []) if isinstance(s, int)]
+        sizes.append(int(metrics["feed_items"]))
+        state["recent_feed_sizes"] = sizes[-FEED_BASELINE_RUNS:]
+
+    state["last_run"] = now.isoformat()
+    state["last_status"] = status
+
+    signature = f"{status}:{','.join(kinds)}"
+    alerted = False
+    if _should_alert(state, status, signature, now):
+        lines = [
+            f"The Woot deals tracker reported: {status}.",
+            "",
+            "Problems:",
+        ]
+        lines += [f"  - {e['kind']}: {e['detail']}" for e in events] or ["  - (none recorded)"]
+        lines += [
+            "",
+            "Run details:",
+        ]
+        lines += [f"  {k}: {v}" for k, v in sorted(metrics.items())]
+        last_success = state.get("last_success")
+        lines += [
+            "",
+            f"Last fully healthy run: {last_success or 'unknown'}",
+            f"Consecutive bad runs: {state.get('consecutive_bad_runs')}",
+            "",
+            f"You will not be alerted about this again for {ALERT_COOLDOWN_HOURS}h "
+            f"unless the problem changes.",
+        ]
+        alerted = send_alert(
+            f"{status} ({', '.join(kinds)})",
+            "\n".join(lines),
+        )
+        if alerted:
+            if state.get("last_alert_signature") == signature:
+                state["incident_alert_count"] = int(state.get("incident_alert_count", 0)) + 1
+            else:
+                state["incident_alert_count"] = 1
+            state["last_alert_signature"] = signature
+            state["last_alert_sent"] = now.isoformat()
+            state["alert_log"] = (_recent_alert_count(state, now) + [now.isoformat()])[-20:]
+        else:
+            # Could not tell the user. Make it as loud as possible in the logs so
+            # the external monitoring alert is the backstop.
+            logging.error(f"{HEALTH_MARKER}_ALERT_FAILED status={status} problems={','.join(kinds)}")
+
+    # Tell the user when things come back, but only if they were told it broke.
+    elif status == "ok" and state.get("last_alert_signature"):
+        send_alert("recovered", "The Woot deals tracker is working again.")
+        state.pop("last_alert_signature", None)
+        state.pop("last_alert_sent", None)
+        state.pop("incident_alert_count", None)
+
+    save_health_state(state)
+    return status
+
+
+def start_run_budget():
+    """Begin the wall-clock budget for one scheduled run."""
+    global _run_deadline
+    _run_deadline = time.monotonic() + RUN_BUDGET_SECONDS
+
+
+def end_run_budget():
+    """Clear the budget so a finished run's deadline cannot leak into the next one."""
+    global _run_deadline
+    _run_deadline = None
+
+
+def budget_remaining():
+    """Seconds left in this run's budget (infinite when no run is in progress)."""
+    if _run_deadline is None:
+        return float("inf")
+    return _run_deadline - time.monotonic()
+
+
+def _throttle():
+    """Space out Woot API requests so we stay under the API's rate limit."""
+    global _last_request_time
+    wait = MIN_REQUEST_INTERVAL - (time.monotonic() - _last_request_time)
+    if wait > 0:
+        time.sleep(wait)
+    _last_request_time = time.monotonic()
+
+
+def _retry_after_seconds(response, fallback):
+    """Honour a Retry-After header when the API sends one."""
+    header = response.headers.get("Retry-After") if response is not None else None
+    if header:
+        try:
+            return max(0.0, min(MAX_RETRY_DELAY, float(header)))
+        except (TypeError, ValueError):
+            pass
+    return fallback
+
+
+def woot_request(method, url, accept_statuses=(200,), **kwargs):
+    """
+    Make a rate-limit-aware request to the Woot API.
+
+    Returns the Response once its status is in accept_statuses, or None if the
+    request failed or retries were exhausted. A 429 is retried with exponential
+    backoff rather than abandoned: giving up on the first 429 is what silently
+    truncated the feed to its first ~13 pages.
+    """
+    kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+    headers = dict(kwargs.pop("headers", None) or {})
+    headers.setdefault("x-api-key", WOOT_API_KEY)
+    headers.setdefault("Accept", "application/json")
+
+    retry_delay = INITIAL_RETRY_DELAY
+    for attempt in range(MAX_RETRIES + 1):
+        response = None
+        try:
+            _throttle()
+            response = requests.request(method, url, headers=headers, **kwargs)
+        except requests.RequestException as e:
+            logging.warning(f"Request to {url} failed: {e}")
+
+        if response is not None:
+            if response.status_code in accept_statuses:
+                return response
+            if response.status_code not in (429, 500, 502, 503, 504):
+                logging.error(
+                    f"Non-retryable {response.status_code} from {url}: {response.text[:200]}"
+                )
+                return None
+            if response.status_code == 429:
+                _feed_stats["rate_limit_hits"] = _feed_stats.get("rate_limit_hits", 0) + 1
+            logging.warning(f"Retryable {response.status_code} from {url}")
+
+        if attempt == MAX_RETRIES:
+            break
+
+        delay = _retry_after_seconds(response, retry_delay) + random.uniform(0, 1)
+        if delay > budget_remaining() - 10:
+            logging.error(f"Not enough run budget left to retry {url}; giving up")
+            return None
+
+        logging.warning(f"Retry {attempt + 1}/{MAX_RETRIES} for {url} in {delay:.1f}s")
+        time.sleep(delay)
+        retry_delay = min(MAX_RETRY_DELAY, retry_delay * 2)
+
+    logging.error(f"Giving up on {url} after {MAX_RETRIES} retries")
+    return None
+
+
 def fetch_feed():
-    """Fetch the feed from the Woot API with pagination support."""
+    """
+    Fetch every page of the Woot feed.
+
+    Returns (items, complete). `complete` is False when the feed was cut short by
+    a rate limit, an API error, or the run budget, so the caller can avoid
+    recording offers it never actually looked at as "seen".
+    """
     logging.info("Fetching feed from Woot API")
-    headers = {
-        "x-api-key": WOOT_API_KEY,
-        "Accept": "application/json"
-    }
-    
+
+    _feed_stats.clear()
+    _feed_stats.update({"pages_fetched": 0, "reported_pages": 0,
+                        "rate_limit_hits": 0, "schema_ok": True})
+
     all_items = []
     current_page = 1
-    total_pages = 1  # Initialize to at least 1 page
-    
-    try:
-        while current_page <= total_pages:
-            # Add page parameter for pagination
-            page_url = f"{FEED_ENDPOINT}?page={current_page}"
-            logging.info(f"Making request to page {current_page} of {total_pages}: {page_url}")
-            response = requests.get(page_url, headers=headers)
-            logging.info(f"Received response with status code: {response.status_code}")
-            
-            if response.status_code != 200:
-                logging.error(f"Error response: {response.text}")
-                break
-                
-            response.raise_for_status()
+    total_pages = 1
+    complete = True
+
+    while current_page <= total_pages and current_page <= MAX_FEED_PAGES:
+        if budget_remaining() < FEED_BUDGET_RESERVE:
+            logging.error(
+                f"Run budget exhausted after {current_page - 1}/{total_pages} feed pages; "
+                f"remaining pages will be picked up on the next run"
+            )
+            complete = False
+            break
+
+        page_url = f"{FEED_ENDPOINT}?page={current_page}"
+        response = woot_request("GET", page_url, accept_statuses=(200, 404))
+        if response is None:
+            logging.error(f"Failed to fetch feed page {current_page}/{total_pages}")
+            complete = False
+            break
+
+        if response.status_code == 404:
+            # The API reports one more page than it actually serves, so a 404 on
+            # the last advertised page is the real end of the feed. A 404 before
+            # that is a route/permission change and must not read as a clean end.
+            if all_items and current_page >= total_pages:
+                logging.info(
+                    f"Feed ended at page {current_page - 1} "
+                    f"(the API reported {total_pages} pages)"
+                )
+            else:
+                logging.error(
+                    f"Feed page {current_page} of {total_pages} returned 404 "
+                    f"after reading {len(all_items)} items"
+                )
+                complete = False
+            break
+
+        try:
             api_response = response.json()
-            
-            # Update total pages if available in response
-            if isinstance(api_response, dict) and "TotalPages" in api_response:
-                total_pages = max(total_pages, api_response["TotalPages"])
-                logging.info(f"Updated total pages to {total_pages}")
-            
-            # Extract and normalize items from this page
-            page_items = []
-            
-            if isinstance(api_response, dict):
-                item_list = None
-                if "Items" in api_response and isinstance(api_response["Items"], list):
-                    item_list = api_response["Items"]
-                    logging.info(f"Found {len(item_list)} items on page {current_page}")
-                
-                # Process items from this page
-                if item_list:
-                    for item in item_list:
-                        if isinstance(item, dict):
-                            # Make sure we have a consistent ID field
-                            processed_item = item.copy()
-                            
-                            # Use OfferId as the primary ID, falling back to Id if needed
-                            if "OfferId" in item:
-                                processed_item["Id"] = item["OfferId"]
-                            elif "Id" in item:
-                                processed_item["OfferId"] = item["Id"]
-                                
-                            page_items.append(processed_item)
-                
-                # Add items from this page to our total
-                all_items.extend(page_items)
-            
-            # Move to the next page
-            current_page += 1
-        
-        logging.info(f"Fetched a total of {len(all_items)} items from all {total_pages} pages")
-        return all_items
-    except Exception as e:
-        logging.error(f"Error fetching feed: {e}")
-        logging.error(traceback.format_exc())
-        return []
+        except ValueError as e:
+            logging.error(f"Feed page {current_page} was not valid JSON: {e}")
+            complete = False
+            break
+
+        if not isinstance(api_response, dict):
+            logging.error(f"Unexpected feed payload type: {type(api_response).__name__}")
+            complete = False
+            break
+
+        reported_pages = api_response.get("TotalPages")
+        if not isinstance(reported_pages, int) or reported_pages <= 0:
+            # Without a usable TotalPages the loop would read page 1, find
+            # total_pages still at its initial 1, and exit reporting a complete
+            # feed of 100 items. Treat a broken contract as a broken contract.
+            _feed_stats["schema_ok"] = False
+        if isinstance(reported_pages, int) and reported_pages > 0:
+            _feed_stats["reported_pages"] = max(_feed_stats["reported_pages"],
+                                                reported_pages)
+            if reported_pages > MAX_FEED_PAGES:
+                logging.warning(
+                    f"Feed reports {reported_pages} pages, capping at {MAX_FEED_PAGES}"
+                )
+                complete = False
+            total_pages = min(reported_pages, MAX_FEED_PAGES)
+
+        if "Items" not in api_response:
+            _feed_stats["schema_ok"] = False
+
+        item_list = api_response.get("Items")
+        if not isinstance(item_list, list):
+            # A missing or malformed Items list is an API shape change, not the
+            # end of the feed. Do not let it masquerade as a complete read.
+            logging.error(
+                f"Feed page {current_page} has no usable Items list "
+                f"(got {type(item_list).__name__})"
+            )
+            complete = False
+            break
+
+        if not item_list:
+            # An empty page at the advertised end is a normal finish; an empty
+            # page in the middle means the feed came back short.
+            if current_page >= total_pages:
+                logging.info(f"Feed page {current_page} was empty; end of feed")
+            else:
+                logging.error(
+                    f"Feed page {current_page} of {total_pages} was empty; feed came back short"
+                )
+                complete = False
+            break
+
+        for item in item_list:
+            if not isinstance(item, dict):
+                continue
+            # Normalise the ID field: the feed uses OfferId, getoffers uses Id.
+            processed_item = item.copy()
+            if "OfferId" in item:
+                processed_item["Id"] = item["OfferId"]
+            elif "Id" in item:
+                processed_item["OfferId"] = item["Id"]
+            all_items.append(processed_item)
+
+        logging.info(
+            f"Feed page {current_page}/{total_pages}: {len(item_list)} items "
+            f"({len(all_items)} total so far)"
+        )
+        _feed_stats["pages_fetched"] += 1
+        current_page += 1
+
+    logging.info(
+        f"Fetched {len(all_items)} feed items across {current_page - 1} page(s), complete={complete}"
+    )
+    return all_items, complete
 
 def fetch_detailed_offers(offer_ids):
     """
-    Fetch detailed information for the specified offer IDs with retry logic.
-    Handles rate limiting with exponential backoff.
+    Fetch full offer details for the given IDs, in batches, through the shared
+    rate limiter.
+
+    Returns (offers, fetched_ids). fetched_ids lists only the IDs we actually got
+    a response for, so the caller can leave the rest unseen and retry them next run.
     """
     if not offer_ids:
         logging.info("No offer IDs provided. Skipping detailed offers fetch.")
-        return []
-    
-    batch_size = 10  # Reduced from 25 to avoid rate limits
+        return [], []
+
     all_detailed_offers = []
-    
-    # Process in smaller batches with delays between them
-    for i in range(0, len(offer_ids), batch_size):
-        batch = offer_ids[i:i+batch_size]
-        logging.info(f"Fetching details for batch {i//batch_size + 1}/{(len(offer_ids)+batch_size-1)//batch_size} with {len(batch)} offer IDs")
-        
-        headers = {
-            "x-api-key": WOOT_API_KEY,
-            "Accept": "application/json",
-            "Content-Type": "application/json"
-        }
-        
-        # Add random jitter to delay to prevent synchronized requests
-        delay_with_jitter = BASE_DELAY_BETWEEN_BATCHES + random.uniform(0.5, 2.0)
-        
-        # Wait before making a request (except for the first batch)
-        if i > 0:
-            logging.info(f"Waiting {delay_with_jitter:.2f} seconds before next batch...")
-            time.sleep(delay_with_jitter)
-        
-        retry_count = 0
-        retry_delay = INITIAL_RETRY_DELAY
-        
-        while retry_count <= MAX_RETRIES:
-            try:
-                logging.info(f"Making request to {GETOFFERS_ENDPOINT}")
-                logging.info(f"Request data: {json.dumps(batch)}")
-                
-                response = requests.post(
-                    GETOFFERS_ENDPOINT, 
-                    headers=headers, 
-                    data=json.dumps(batch)
-                )
-                
-                logging.info(f"Received response with status code: {response.status_code}")
-                
-                # Success case
-                if response.status_code == 200:
-                    detailed_offers = response.json()
-                    
-                    if isinstance(detailed_offers, list):
-                        logging.info(f"Fetched {len(detailed_offers)} detailed offers from the API.")
-                        all_detailed_offers.extend(detailed_offers)
-                    else:
-                        logging.warning(f"Detailed offers response is not a list: {type(detailed_offers)}")
-                    
-                    # Success, exit the retry loop
-                    break
-                    
-                # Rate limiting case
-                elif response.status_code == 429:
-                    retry_count += 1
-                    
-                    if retry_count <= MAX_RETRIES:
-                        logging.warning(f"Rate limited (429). Retry {retry_count}/{MAX_RETRIES}. Waiting {retry_delay} seconds...")
-                        time.sleep(retry_delay)
-                        
-                        # Exponential backoff with jitter
-                        retry_delay = min(MAX_RETRY_DELAY, retry_delay * 2) + random.uniform(0, 1)
-                    else:
-                        logging.error(f"Max retries reached for batch. Moving to next batch.")
-                        break
-                
-                # Other error cases
-                else:
-                    logging.error(f"Error response: {response.text}")
-                    retry_count += 1
-                    
-                    if retry_count <= MAX_RETRIES:
-                        logging.warning(f"Error {response.status_code}. Retry {retry_count}/{MAX_RETRIES}. Waiting {retry_delay} seconds...")
-                        time.sleep(retry_delay)
-                        
-                        # Exponential backoff with jitter
-                        retry_delay = min(MAX_RETRY_DELAY, retry_delay * 2) + random.uniform(0, 1)
-                    else:
-                        logging.error(f"Max retries reached for batch. Moving to next batch.")
-                        break
-                        
-            except Exception as e:
-                logging.error(f"Error fetching detailed offers batch: {e}")
-                logging.error(traceback.format_exc())
-                
-                retry_count += 1
-                if retry_count <= MAX_RETRIES:
-                    logging.warning(f"Exception occurred. Retry {retry_count}/{MAX_RETRIES}. Waiting {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    
-                    # Exponential backoff with jitter
-                    retry_delay = min(MAX_RETRY_DELAY, retry_delay * 2) + random.uniform(0, 1)
-                else:
-                    logging.error(f"Max retries reached for batch. Moving to next batch.")
-                    break
-    
-    logging.info(f"Total detailed offers fetched: {len(all_detailed_offers)}")
-    return all_detailed_offers
+    fetched_ids = []
+    total_batches = (len(offer_ids) + DETAIL_BATCH_SIZE - 1) // DETAIL_BATCH_SIZE
+
+    for i in range(0, len(offer_ids), DETAIL_BATCH_SIZE):
+        batch = offer_ids[i:i + DETAIL_BATCH_SIZE]
+        batch_num = i // DETAIL_BATCH_SIZE + 1
+
+        if budget_remaining() < 15:
+            logging.error(
+                f"Run budget exhausted after {batch_num - 1}/{total_batches} detail batches; "
+                f"{len(offer_ids) - len(fetched_ids)} offers deferred to the next run"
+            )
+            break
+
+        logging.info(
+            f"Fetching detail batch {batch_num}/{total_batches} with {len(batch)} offer IDs"
+        )
+        response = woot_request(
+            "POST",
+            GETOFFERS_ENDPOINT,
+            data=json.dumps(batch),
+            headers={"Content-Type": "application/json"},
+        )
+        if response is None:
+            logging.error(f"Detail batch {batch_num}/{total_batches} failed; deferring to next run")
+            continue
+
+        try:
+            detailed_offers = response.json()
+        except ValueError as e:
+            logging.error(f"Detail batch {batch_num} was not valid JSON: {e}")
+            continue
+
+        if not isinstance(detailed_offers, list):
+            logging.warning(
+                f"Detailed offers response is not a list: {type(detailed_offers).__name__}"
+            )
+            continue
+
+        all_detailed_offers.extend(detailed_offers)
+
+        # Record only the IDs actually present in the response. Crediting the
+        # whole batch would mark silently-omitted offers as seen without ever
+        # keyword-checking them, and they are exactly the ones that passed the
+        # pre-filter.
+        returned = {o.get("Id") or o.get("OfferId") for o in detailed_offers
+                    if isinstance(o, dict)}
+        present = [offer_id for offer_id in batch if offer_id in returned]
+        fetched_ids.extend(present)
+        if len(present) != len(batch):
+            logging.warning(
+                f"Detail batch {batch_num}: asked for {len(batch)} offers, "
+                f"{len(present)} came back; the rest will be retried"
+            )
+
+    logging.info(
+        f"Total detailed offers fetched: {len(all_detailed_offers)} "
+        f"for {len(fetched_ids)}/{len(offer_ids)} requested IDs"
+    )
+    return all_detailed_offers, fetched_ids
 
 def is_matching_deal(deal):
-    """Check if a deal matches our keywords."""
-    # Use either Id or OfferId, whichever is available
+    """Check whether a detailed offer matches our keywords."""
     deal_id = deal.get("Id", deal.get("OfferId", "unknown"))
-    logging.info(f"Checking if deal {deal_id} matches keywords")
-    
-    # Check title
-    title = deal.get("Title", "") or ""
-    if any(keyword.lower() in title.lower() for keyword in KEYWORDS):
-        logging.info(f"Deal {deal_id} matches keywords in title: {title}")
-        return True
-    
-    # Check description/writeup
-    writeup = deal.get("WriteUpBody", "") or ""
-    if any(keyword.lower() in writeup.lower() for keyword in KEYWORDS):
-        logging.info(f"Deal {deal_id} matches keywords in writeup")
-        return True
-    
-    # Check features
-    features = deal.get("Features", "") or ""
-    if any(keyword.lower() in features.lower() for keyword in KEYWORDS):
-        logging.info(f"Deal {deal_id} matches keywords in features")
-        return True
-        
-    # Check subtitle if available
-    subtitle = deal.get("Subtitle", "") or ""
-    if any(keyword.lower() in subtitle.lower() for keyword in KEYWORDS):
-        logging.info(f"Deal {deal_id} matches keywords in subtitle")
-        return True
-    
-    # Check snippet if available
-    snippet = deal.get("Snippet", "") or ""
-    if any(keyword.lower() in snippet.lower() for keyword in KEYWORDS):
-        logging.info(f"Deal {deal_id} matches keywords in snippet")
-        return True
-        
-    logging.info(f"Deal {deal_id} does not match any keywords")
+
+    for field in ("Title", "Subtitle", "WriteUpBody", "Features", "Snippet", "Slug"):
+        hits = matched_keywords(deal.get(field))
+        if hits:
+            logging.info(f"Deal {deal_id} matches {hits} in field '{field}'")
+            return True
+
     return False
 
 def filter_deals(deals, seen_deals):
-    """Filter deals that match our keywords and haven't been seen before."""
-    logging.info(f"Filtering {len(deals)} deals against {len(seen_deals)} seen deals")
+    """Return the deals that match our keywords and have not been seen before."""
+    logging.info(f"Filtering {len(deals)} detailed offers against {len(seen_deals)} seen deals")
     new_matching_deals = []
-    
+
     for deal in deals:
-        # Try both Id and OfferId fields for compatibility
         unique_id = deal.get("Id", deal.get("OfferId"))
         if not unique_id:
-            logging.warning(f"Deal has no Id or OfferId: {json.dumps({k: v for k, v in deal.items() if k in ['Title', 'Url']}, indent=2)}")
+            logging.warning(f"Detailed offer has no Id or OfferId: {deal.get('Title', '?')}")
             continue
-            
+
         if unique_id in seen_deals:
-            logging.info(f"Deal {unique_id} has been seen before, skipping")
             continue
-            
+
         if is_matching_deal(deal):
-            logging.info(f"Found new matching deal: {unique_id}")
             new_matching_deals.append(deal)
-            
+
     logging.info(f"Found {len(new_matching_deals)} new matching deals.")
     return new_matching_deals
 
@@ -615,8 +1133,10 @@ def format_deal_notifications(deal):
     deal_id = deal.get("Id", deal.get("OfferId", "unknown"))
     logging.info(f"Formatting notifications for deal {deal_id}")
     
-    title = deal.get("Title", "No Title")
-    url = deal.get("Url", "No URL")
+    # These fields are sometimes present but null in the live feed, so a plain
+    # .get() default is not enough -- it only fires when the key is absent.
+    title = deal.get("Title") or "No Title"
+    url = deal.get("Url") or "No URL"
     
     # Get price information - handle different possible structures
     sale_price = None
@@ -625,7 +1145,7 @@ def format_deal_notifications(deal):
     
     # Try to get price from Items field
     items = deal.get("Items", [])
-    if items and isinstance(items, list) and len(items) > 0:
+    if isinstance(items, list) and items and isinstance(items[0], dict):
         sale_price = items[0].get("SalePrice", None)
         list_price = items[0].get("ListPrice", None)
         
@@ -637,7 +1157,8 @@ def format_deal_notifications(deal):
         sale_price_data = deal.get("SalePrice")
         list_price = deal.get("ListPrice")
         
-        if isinstance(sale_price_data, list) and len(sale_price_data) > 0:
+        if (isinstance(sale_price_data, list) and sale_price_data
+                and isinstance(sale_price_data[0], dict)):
             # Handle price range format
             min_price = sale_price_data[0].get("Minimum", None)
             if min_price is not None:
@@ -679,11 +1200,11 @@ def format_deal_notifications(deal):
     return title, email_body, text_message
 
 def send_notifications(deals):
-    """Send email and text notifications for new deals."""
+    """Send email and text notifications for new deals. Returns True on success."""
     if not deals:
         logging.info("No deals to send notifications for. Skipping.")
-        return
-        
+        return False
+
     logging.info(f"Preparing to send notifications for {len(deals)} deals")
     try:
         # Send text messages to the phone number
@@ -691,69 +1212,80 @@ def send_notifications(deals):
         text_msg['Subject'] = f"Woot Deal Alert"
         text_msg['From'] = GMAIL_USER
         text_msg['To'] = EMAIL_RECIPIENT  # This is the phone number email
-        
+
         # Send detailed emails to the sender's address
         email_msg = MIMEMultipart('alternative')
         email_msg['Subject'] = f"Woot Alert: {len(deals)} new deal(s) matching your keywords"
         email_msg['From'] = GMAIL_USER
         email_msg['To'] = GMAIL_USER  # Send to yourself
-        
+
         text_parts = []
         html_parts = []
-        sms_parts = []
-        
+
+        formatted = 0
         for deal in deals:
-            title, html_content, sms_content = format_deal_notifications(deal)
-            text_parts.append(f"{title} - {deal.get('Url', 'No URL')}")
+            # Isolate per-deal formatting: a single malformed offer used to raise
+            # here, fail the whole send, and defer every good deal with it -- then
+            # do the same thing again on every subsequent run, forever.
+            try:
+                title, html_content, _sms_content = format_deal_notifications(deal)
+            except Exception as e:
+                deal_id = deal.get("Id", deal.get("OfferId", "unknown"))
+                logging.error(f"Could not format deal {deal_id}, skipping it: {e}")
+                record_health_event("deal_format_failed", f"offer {deal_id}: {e}")
+                continue
+            text_parts.append(f"{title} - {deal.get('Url') or 'No URL'}")
             html_parts.append(html_content)
-            sms_parts.append(sms_content)
-        
-        # For SMS - use a simple summary format instead of listing each deal
-        # Find which keywords matched
-        matched_keywords = set()
+            formatted += 1
+
+        if not formatted:
+            logging.error("No deals could be formatted; nothing to send")
+            return False
+
+        # For SMS - use a simple summary format instead of listing each deal.
+        # Go through matched_keywords() so a field that is present but null does
+        # not raise and take the whole notification down with it.
+        keyword_hits = set()
         for deal in deals:
-            for keyword in KEYWORDS:
-                if (keyword.lower() in deal.get("Title", "").lower() or 
-                    keyword.lower() in deal.get("WriteUpBody", "").lower() or
-                    keyword.lower() in deal.get("Features", "").lower() or
-                    keyword.lower() in deal.get("Subtitle", "").lower() or
-                    keyword.lower() in deal.get("Snippet", "").lower()):
-                    matched_keywords.add(keyword)
-        
+            for field in ("Title", "Subtitle", "WriteUpBody", "Features", "Snippet"):
+                keyword_hits.update(matched_keywords(deal.get(field)))
+
         # Create a comma-separated list of matched keywords
-        keywords_str = ", ".join(matched_keywords)
+        keywords_str = ", ".join(sorted(keyword_hits))
         # Truncate if too long
         if len(keywords_str) > 50:
             keywords_str = keywords_str[:47] + "..."
-        
+
         # Create the summary message
         sms_content = f"({len(deals)}) deals found for keywords: {keywords_str}"
         logging.info(f"SMS summary: {sms_content}")
         text_msg.attach(MIMEText(sms_content, 'plain'))
-        
+
         # For email - use full HTML
         text_content = "\n\n".join(text_parts)
         html_content = "<html><body>" + "".join(html_parts) + "</body></html>"
         email_msg.attach(MIMEText(text_content, 'plain'))
         email_msg.attach(MIMEText(html_content, 'html'))
-        
+
         # Send both messages
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
             server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-            
+
             # Send text message first
             server.send_message(text_msg)
             logging.info("Text message sent successfully")
-            
+
             # Send detailed email
             server.send_message(email_msg)
             logging.info("Email notification sent successfully")
-            
+
         logging.info(f"Sent notifications for {len(deals)} deals")
-        
+        return True
+
     except Exception as e:
         logging.error(f"Error sending notifications: {e}")
         logging.error(traceback.format_exc())
+        return False
 
 def run_all_tests():
     """Run all diagnostic tests."""
@@ -777,227 +1309,382 @@ def run_all_tests():
     logging.info(f"Overall test result: {'PASS' if all_passed else 'FAIL'}")
     return results
 
-def title_contains_keywords(title):
-    """
-    Check if the title contains any of our keywords.
-    This is used for pre-filtering to reduce API calls.
-    """
-    if not title:
-        return False
-    
-    title_lower = title.lower()
-    return any(keyword.lower() in title_lower for keyword in KEYWORDS)
-
 def improved_title_contains_keywords(item):
     """
-    Check if any relevant text fields in the item contain keywords.
-    This is used for pre-filtering to reduce API calls.
+    Check whether a feed item mentions any keyword.
+
+    Used to pre-filter the feed so getoffers calls (which are the rate-limited,
+    expensive ones) are only spent on plausible matches.
     """
     if not isinstance(item, dict):
         return False
-    
-    # Check all these potential text fields
+
     fields_to_check = [
         "Title", "title",
         "Description", "description",
         "Subtitle", "subtitle",
-        "Snippet", "snippet", 
+        "Snippet", "snippet",
         "Summary", "summary",
         "Name", "name",
         "ProductName", "productName",
         "WriteUpBody", "writeUpBody",
-        "Features", "features"
+        "Features", "features",
+        # Slug carries the product name even when Title is generic; normalize_text
+        # flattens its hyphens so multi-word keywords still match.
+        "Slug", "slug",
     ]
-    
-    # Get the item ID for logging
-    item_id = item.get("OfferId", item.get("Id", "unknown"))
-    
+
     for field in fields_to_check:
-        value = item.get(field, "")
-        if value and isinstance(value, str):
-            value_lower = value.lower()
-            for keyword in KEYWORDS:
-                if keyword.lower() in value_lower:
-                    logging.info(f"✓ Found keyword '{keyword}' in field '{field}': '{value[:50]}...'")
-                    return True
-    
-    logging.debug(f"No keywords found in any checked fields for item {item_id}")
+        hits = matched_keywords(item.get(field))
+        if hits:
+            item_id = item.get("OfferId", item.get("Id", "unknown"))
+            logging.info(f"Pre-filter hit on {item_id}: {hits} in field '{field}'")
+            return True
+
+    categories = item.get("Categories")
+    if isinstance(categories, list):
+        hits = matched_keywords(" ".join(c for c in categories if isinstance(c, str)))
+        if hits:
+            item_id = item.get("OfferId", item.get("Id", "unknown"))
+            logging.info(f"Pre-filter hit on {item_id}: {hits} in Categories")
+            return True
+
     return False
 
 def check_woot_deals(request):
     """
     Main function to check for Woot deals.
-    This function can be triggered by HTTP request or Cloud Scheduler.
+
+    Returns (body, http_status). A hard failure returns 5xx so Cloud Scheduler
+    records the job as failed instead of quietly going green, which is what let
+    the original bug hide for months.
     """
     # Extract test mode from request if provided
     test_mode = None
     if request and hasattr(request, 'args') and request.args:
         test_mode = request.args.get('test')
-    
+
     logging.info(f"====== STARTING WOOT DEALS CHECK {'(TEST MODE: ' + test_mode + ')' if test_mode else ''} ======")
-    
+
     # If a specific test is requested, run only that test
     if test_mode:
-        if test_mode == "env":
-            test_environment_variables()
-            return "Environment variables test completed. Check logs for results."
-        elif test_mode == "storage":
-            test_storage_access()
-            return "Storage access test completed. Check logs for results."
-        elif test_mode == "api":
-            test_woot_api()
-            return "Woot API test completed. Check logs for results."
-        elif test_mode == "email":
-            test_email()
-            return "Email test completed. Check logs for results."
-        elif test_mode == "structure":  # Add new test option
-            test_woot_api_structure()
-            return "Woot API structure test completed. Check logs for results."
-        elif test_mode == "all":
-            run_all_tests()
-            return "All diagnostic tests completed. Check logs for results."
-    
+        start_run_budget()  # diagnostics make API calls too, so pace them
+        try:
+            if test_mode == "env":
+                test_environment_variables()
+                return "Environment variables test completed. Check logs for results.", 200
+            elif test_mode == "storage":
+                test_storage_access()
+                return "Storage access test completed. Check logs for results.", 200
+            elif test_mode == "api":
+                test_woot_api()
+                return "Woot API test completed. Check logs for results.", 200
+            elif test_mode == "email":
+                test_email()
+                return "Email test completed. Check logs for results.", 200
+            elif test_mode == "structure":
+                test_woot_api_structure()
+                return "Woot API structure test completed. Check logs for results.", 200
+            elif test_mode == "all":
+                run_all_tests()
+                return "All diagnostic tests completed. Check logs for results.", 200
+        finally:
+            end_run_budget()
+
     # Regular operation
     logging.info("Starting regular operation")
-    
-    # Log environment variables status
-    env_vars_set = test_environment_variables()
-    if not env_vars_set:
-        logging.error("Missing required environment variables. Cannot proceed.")
-        return "Error: Missing required environment variables"
-    
-    # Load previously seen deal IDs
+    reset_health_events()
+    start_run_budget()
+    global _feed_was_fetched
+    _feed_was_fetched = False
+    try:
+        return _run_deal_check()
+    finally:
+        end_run_budget()
+
+
+def _run_deal_check():
+    """One full pass over the feed. Returns (body, http_status)."""
+    metrics = {"feed_items": 0, "feed_complete": "false", "matches": 0, "notified": "false"}
+
+    if not storage_client:
+        # Set at import time; if it failed, this instance can never read or write
+        # state and will abort every run until it is replaced.
+        record_health_event("storage_client_uninitialized",
+                            "Cloud Storage client failed to initialize at startup")
+        report_run_health("failed", metrics)
+        return "Error: storage client unavailable", 503
+
+    if not test_environment_variables():
+        record_health_event("missing_env_vars", "one or more required settings are unset")
+        report_run_health("failed", metrics)
+        return "Error: Missing required environment variables", 500
+
+    # Load previously seen deal IDs. A read failure is fatal for this run: carrying
+    # on with an empty index would treat every live deal as new and spam alerts.
     seen_deals = load_seen_deals()
-    
-    # Step 1: Fetch the feed to get basic deal information
-    feed_items = fetch_feed()
+    if seen_deals is None:
+        record_health_event("seen_state_unreadable",
+                            f"could not read {SEEN_DEALS_FILENAME} from {BUCKET_NAME}")
+        report_run_health("failed", metrics)
+        return "Error: could not read seen-deals state", 503
+
+    # Step 1: fetch the feed
+    global _feed_was_fetched
+    feed_items, feed_complete = fetch_feed()
+    _feed_was_fetched = True
+    metrics["feed_items"] = len(feed_items)
+    metrics["feed_complete"] = str(feed_complete).lower()
+
     if not feed_items:
-        logging.info("No feed items found. Exiting.")
-        return "No feed items found"
-    
-    # Step 2: Pre-filter feed items by checking multiple fields to reduce API calls
+        record_health_event("feed_empty", "the feed returned no items at all")
+        report_run_health("failed", metrics)
+        return "Error: no feed items found", 502
+
+    if not feed_complete:
+        # Deliberately not a 5xx: an immediate scheduler retry would just spend
+        # more of the rate-limit budget. The health report is the alert path.
+        record_health_event("feed_incomplete",
+                            f"only {len(feed_items)} items read before the feed was cut short")
+
+    # Step 2: pre-filter on the feed's own text fields so getoffers calls are only
+    # spent on plausible matches.
+    feed_ids = []
     potential_matches = []
-    all_offer_ids = []  # Track all offers for seen deals list
-    
-    logging.info(f"Pre-filtering {len(feed_items)} items from the feed")
-    
+    already_seen = 0
+
     for item in feed_items:
-        # Get the ID for tracking
-        offer_id = None
-        if "OfferId" in item:
-            offer_id = item["OfferId"]
-        elif "Id" in item:
-            offer_id = item["Id"]
-        
+        offer_id = item.get("OfferId") or item.get("Id")
         if not offer_id:
             continue
-            
-        # Add to all offers list
-        all_offer_ids.append(offer_id)
-        
-        # Skip if already seen
+
+        feed_ids.append(offer_id)
+
         if offer_id in seen_deals:
-            logging.info(f"Deal {offer_id} has been seen before, skipping")
+            already_seen += 1
             continue
-        
-        # Use improved prefiltering that checks multiple fields
+
         if improved_title_contains_keywords(item):
-            logging.info(f"Pre-filter match found for item {offer_id}")
             potential_matches.append(offer_id)
-    
-    logging.info(f"Pre-filtered {len(feed_items)} items down to {len(potential_matches)} potential matches")
-    
-    # If no potential matches from expanded field screening, we're done
-    if not potential_matches:
-        # Add all offer IDs to seen deals to avoid checking them again
-        seen_deals.extend([id for id in all_offer_ids if id not in seen_deals])
-        save_seen_deals(seen_deals)
-        
-        logging.info("No potential matches found in pre-filtering. Exiting.")
-        return "No matching deals found."
-    
-    # Step 3: Process potential matches with rate limiting awareness
-    all_matching_deals = []
-    batch_size = 10  # Smaller batch size to avoid rate limits
-    total_batches = (len(potential_matches) + batch_size - 1) // batch_size  # Ceiling division
-    processed_deal_ids = []  # NEW: Track all processed deals separately from seen_deals
-    
-    logging.info(f"Processing {len(potential_matches)} potential matches in {total_batches} batches of {batch_size}")
-    
-    for i in range(0, len(potential_matches), batch_size):
-        batch_num = i // batch_size + 1
-        batch = potential_matches[i:i+batch_size]
-        logging.info(f"Processing batch {batch_num}/{total_batches} with {len(batch)} offers")
-        
-        # Add delay between batches (except for the first one)
-        if i > 0:
-            delay = BASE_DELAY_BETWEEN_BATCHES + random.uniform(0.5, 2.0)
-            logging.info(f"Waiting {delay:.2f} seconds before processing next batch...")
-            time.sleep(delay)
-        
-        # Fetch detailed information for this batch (with retry logic built in)
-        detailed_offers = fetch_detailed_offers(batch)
-        
-        # Step 4: Filter for new matching deals (full check with all fields)
-        batch_matching_deals = filter_deals(detailed_offers, seen_deals)
-        
-        # Add new matches to our results list
-        all_matching_deals.extend(batch_matching_deals)
-        
-        # NEW: Track processed IDs but don't add to seen_deals yet
-        for deal in detailed_offers:
+
+    check_feed_health(len(feed_items), feed_ids, feed_items, feed_complete)
+
+    metrics["pages"] = _feed_stats.get("pages_fetched", 0)
+    metrics["reported_pages"] = _feed_stats.get("reported_pages", 0)
+    metrics["rate_limit_hits"] = _feed_stats.get("rate_limit_hits", 0)
+    metrics["canary_hits"] = count_canary_hits(feed_items)
+    metrics["new_items"] = len(feed_ids) - already_seen
+    metrics["potential_matches"] = len(potential_matches)
+    logging.info(
+        f"Pre-filtered {len(feed_items)} feed items: {already_seen} already seen, "
+        f"{metrics['new_items']} new, {len(potential_matches)} potential matches"
+    )
+
+    # Step 3: pull full details for the potential matches and confirm them
+    matching_deals = []
+    processed_ids = []
+    if potential_matches:
+        detailed_offers, processed_ids = fetch_detailed_offers(potential_matches)
+        matching_deals = filter_deals(detailed_offers, seen_deals)
+
+        missed = len(potential_matches) - len(processed_ids)
+        if missed:
+            record_health_event(
+                "detail_fetch_incomplete",
+                f"{missed} of {len(potential_matches)} candidate offers could not be checked"
+            )
+
+    metrics["matches"] = len(matching_deals)
+
+    # Step 4: notify
+    notified = False
+    if matching_deals:
+        logging.info(f"Found {len(matching_deals)} new matching deals. Sending notifications.")
+        notified = send_notifications(matching_deals)
+        if not notified:
+            record_health_event(
+                "notification_failed",
+                f"{len(matching_deals)} matching deals could not be sent; they stay queued"
+            )
+    metrics["notified"] = str(notified).lower()
+
+    # Step 5: record what we actually evaluated. Offers whose details we could not
+    # fetch, and matches we could not notify about, are deliberately left out so
+    # the next run picks them up again.
+    deferred = set(potential_matches) - set(processed_ids)
+    if not notified:
+        for deal in matching_deals:
             unique_id = deal.get("Id", deal.get("OfferId"))
-            if unique_id and unique_id not in processed_deal_ids:
-                processed_deal_ids.append(unique_id)
-    
-    # Send notifications if we found any matching deals
-    if all_matching_deals:
-        logging.info(f"Found a total of {len(all_matching_deals)} new matching deals. Sending notifications.")
-        try:
-            # Attempt to send notifications
-            send_notifications(all_matching_deals)
-            
-            # Only NOW add the deals to the seen list - AFTER successful notification
-            # Add matching deals to seen_deals
-            for deal in all_matching_deals:
-                unique_id = deal.get("Id", deal.get("OfferId"))
-                if unique_id and unique_id not in seen_deals:
-                    seen_deals.append(unique_id)
-            
-            # NEW: Add remaining processed deals (non-matching deals) to seen_deals
-            for deal_id in processed_deal_ids:
-                if deal_id not in seen_deals:
-                    seen_deals.append(deal_id)
-            
-            # Save updated seen deals list
-            save_seen_deals(seen_deals)
-            
-            result_message = f"Found and notified about {len(all_matching_deals)} new deals"
-            logging.info(result_message)
-            return result_message
-            
-        except Exception as e:
-            # If notification fails, don't mark deals as seen
-            logging.error(f"Failed to send notifications: {e}")
-            logging.error(traceback.format_exc())
-            return f"Error sending notifications: {e}"
-    else:
-        # No matching deals found, but still mark processed IDs as seen
-        for deal_id in processed_deal_ids:
-            if deal_id not in seen_deals:
-                seen_deals.append(deal_id)
-        
-        # Also mark any remaining IDs from all_offer_ids as seen
-        for deal_id in all_offer_ids:
-            if deal_id not in seen_deals:
-                seen_deals.append(deal_id)
-        
-        save_seen_deals(seen_deals)
-        
-        result_message = "No new matching deals found."
-        logging.info(result_message)
-        return result_message
-    
+            if unique_id:
+                deferred.add(unique_id)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for offer_id in feed_ids:
+        if offer_id not in deferred:
+            seen_deals[offer_id] = now_iso
+
+    # Only prune after a complete feed: a truncated run has not refreshed the
+    # timestamps of offers living on the pages it never reached.
+    if feed_complete:
+        seen_deals = prune_seen_deals(seen_deals)
+
+    if not save_seen_deals(seen_deals):
+        # Left unchecked this is the worst storm vector in the service: state
+        # never advances, so every matching deal is re-sent every single hour.
+        record_health_event(
+            "seen_state_unwritable",
+            "could not save seen deals; matching offers would be re-sent every run"
+        )
+    metrics["seen_deals"] = len(seen_deals)
+    metrics["deferred"] = len(deferred)
+
+    # A state file that reads and writes cleanly can still hold the wrong thing.
+    if not (SEEN_STATE_MIN <= len(seen_deals) <= SEEN_STATE_MAX):
+        record_health_event(
+            "seen_state_implausible",
+            f"the seen index holds {len(seen_deals)} entries, outside the expected "
+            f"{SEEN_STATE_MIN}-{SEEN_STATE_MAX}"
+        )
+
+    metrics["duration_s"] = round(RUN_BUDGET_SECONDS - budget_remaining(), 1)
+    if metrics["duration_s"] > RUN_BUDGET_SECONDS * RUN_DURATION_WARN_RATIO:
+        record_health_event(
+            "run_near_deadline",
+            f"the run took {metrics['duration_s']}s of a {RUN_BUDGET_SECONDS}s budget"
+        )
+
+    status = report_run_health("ok", metrics)
+
+    result_message = (
+        f"Feed items: {len(feed_items)} (complete={feed_complete}); "
+        f"potential matches: {len(potential_matches)}; "
+        f"new matching deals: {len(matching_deals)}; "
+        f"notified: {notified}; deferred: {len(deferred)}; health: {status}"
+    )
+    logging.info(result_message)
+    # A degraded run still did useful work, so it is not a scheduler failure; the
+    # health report is what raises it.
+    return result_message, 200
+
+
+def feed_baseline(state):
+    """
+    The median feed size over recent healthy runs, or None without enough data.
+
+    A median rather than a mean so one anomalous run cannot move it, and only
+    healthy runs contribute -- a baseline fed by truncated runs walks down to
+    meet the failure and quietly disarms the check.
+    """
+    sizes = [s for s in state.get("recent_feed_sizes", []) if isinstance(s, int)]
+    if len(sizes) < FEED_BASELINE_MIN_SAMPLES:
+        return None
+    ordered = sorted(sizes)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) // 2
+
+
+def check_feed_health(feed_items, feed_ids, items, feed_complete):
+    """
+    Check the feed's shape and content, not just that a request succeeded.
+
+    Every check here exists because the original failure kept every ordinary
+    signal green -- HTTP 200, no exception, a plausible-looking run -- while the
+    data underneath was wrong.
+    """
+    # Contract: the feed must tell us how many pages there are and must carry an
+    # Items key. Without that the pagination loop silently reads one page.
+    if not _feed_stats.get("schema_ok", True):
+        record_health_event(
+            "feed_schema_invalid",
+            "the feed response is missing TotalPages or Items, or they changed type"
+        )
+
+    # Did we actually read the whole feed? Page count is a far finer measure of
+    # truncation than item count. The -1 allows for the known off-by-one where
+    # the API advertises one more page than it serves.
+    pages = _feed_stats.get("pages_fetched", 0)
+    reported = _feed_stats.get("reported_pages", 0)
+    if feed_complete and reported and pages < reported - 1:
+        record_health_event(
+            "feed_pages_too_few",
+            f"read {pages} of {reported} pages but the feed reported itself complete"
+        )
+
+    if feed_items < FEED_SIZE_FLOOR:
+        record_health_event(
+            "feed_too_small",
+            f"only {feed_items} items, expected at least {FEED_SIZE_FLOOR}"
+        )
+
+    # Duplicate ids are the one signal that catches pagination being ignored --
+    # that failure inflates the item count and so evades every size check.
+    if feed_ids:
+        duplicates = len(feed_ids) - len(set(feed_ids))
+        if duplicates > len(feed_ids) * FEED_MAX_DUPLICATE_RATIO:
+            record_health_event(
+                "feed_duplicate_ids",
+                f"{duplicates} of {len(feed_ids)} offers are duplicates; "
+                f"pagination may be returning the same page repeatedly"
+            )
+
+    # If the feed stops carrying title text, the matcher matches nothing while
+    # every count, page and status stays green -- the original bug's twin.
+    if items:
+        with_text = sum(1 for i in items if isinstance(i.get("Title"), str) and i["Title"].strip())
+        ratio = with_text / len(items)
+        if ratio < FEED_MIN_TITLE_RATIO:
+            record_health_event(
+                "feed_text_missing",
+                f"only {ratio:.0%} of feed items carry a title; the matcher cannot see them"
+            )
+
+    if _feed_stats.get("rate_limit_hits"):
+        logging.info(
+            f"Feed fetch absorbed {_feed_stats['rate_limit_hits']} rate-limit responses"
+        )
+
+    if reported > FEED_PAGES_WARN:
+        record_health_event(
+            "feed_outgrowing_budget",
+            f"the feed now reports {reported} pages; the run budget supports about "
+            f"{int((RUN_BUDGET_SECONDS - FEED_BUDGET_RESERVE) / MIN_REQUEST_INTERVAL)}"
+        )
+
+    try:
+        baseline = feed_baseline(load_health_state())
+    except Exception as e:
+        logging.warning(f"Could not read the feed baseline: {e}")
+        return
+
+    if baseline and feed_items < baseline * FEED_SHRINK_RATIO:
+        record_health_event(
+            "feed_shrank",
+            f"{feed_items} items against a recent median of {baseline}"
+        )
+
+
+def count_canary_hits(items):
+    """
+    Count feed items mentioning a term Woot always carries.
+
+    Observe-only for now: a matcher regression would drive this to zero within an
+    hour, but the threshold should not be armed until a week of data confirms the
+    term really does appear in every run.
+    """
+    if not CANARY_KEYWORD:
+        return 0
+    needle = normalize_text(CANARY_KEYWORD)
+    hits = 0
+    for item in items:
+        for field in ("Title", "Subtitle", "Slug"):
+            value = item.get(field)
+            if isinstance(value, str) and needle in normalize_text(value):
+                hits += 1
+                break
+    return hits
+
 def test_woot_api_structure():
     """Test the Woot API response structure and prefiltering logic."""
     logging.info("=== TESTING WOOT API STRUCTURE AND PREFILTERING ===")
@@ -1106,18 +1793,31 @@ def test_woot_api_structure():
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def catch_all(path):
+    if path == 'health':
+        return "OK", 200
+
     try:
-        if path == 'health':
-            return "OK", 200
-        elif request.args.get('test'):
-            test_mode = request.args.get('test')
-            return check_woot_deals(request)
-        else:
-            return check_woot_deals(request)
+        return check_woot_deals(request)
     except Exception as e:
         logging.error(f"Error handling request: {e}")
         logging.error(traceback.format_exc())
-        return f"Error: {str(e)}", 500
+        # Report the crash before returning, so an unhandled exception still
+        # reaches the user rather than only the logs.
+        try:
+            record_health_event("unhandled_exception", repr(e))
+            report_run_health("failed", {"feed_items": 0})
+        except Exception:
+            logging.error("Could not report health for the unhandled exception")
+
+        # Only ask for a retry if one could actually help. Once the feed has been
+        # fetched, the Woot rate-limit budget is already spent, and a scheduler
+        # retry would pay for a second full pagination at the worst moment.
+        if _feed_was_fetched:
+            logging.error("Crashed after the feed fetch; not asking for a retry")
+            return "Internal error (already reported)", 200
+
+        # Deliberately vague: this endpoint is reachable without authentication.
+        return "Internal error", 500
 
 # Keep the health endpoint for backward compatibility
 @app.route('/health', methods=['GET'])
