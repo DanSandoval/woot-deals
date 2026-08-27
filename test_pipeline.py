@@ -28,6 +28,26 @@ PAGE_SIZE = 100
 REPORTED_PAGES = 51
 SERVED_PAGES = 50
 
+# Woot caps the All feed at 5000 items while the category feeds together reach
+# ~12400, so All alone shows about 40% of the catalogue. The fake mirrors that:
+# All serves the first 5000 offers and each category adds distinct ones on top.
+# Gourmet and Wootoff are empty, as they were when measured against the live API
+# -- an empty feed is a legitimate answer, not a failure.
+CATEGORY_SLICES = {
+    "Clearance": (5000, 2000),
+    "Computers": (7000, 500),
+    "Electronics": (7500, 500),
+    "Featured": (8000, 10),
+    "Home": (8010, 2000),
+    "Gourmet": (0, 0),
+    "Shirts": (10010, 200),
+    "Sports": (10210, 1000),
+    "Tools": (11210, 790),
+    "Wootoff": (0, 0),
+}
+# What a healthy multi-feed run should merge to.
+CATALOG_SIZE = SERVED_PAGES * PAGE_SIZE + sum(n for _, n in CATEGORY_SLICES.values())
+
 
 def make_item(index):
     """A feed item shaped like the ones the live API returns."""
@@ -68,13 +88,13 @@ class FakeWootApi:
     """Token-bucket rate limiter matching the behaviour seen in production logs."""
 
     def __init__(self, burst=10, refill_per_second=1.0, enforce_limit=True,
-                 serve_full_feed=False):
+                 serve_full_feed=True):
         self.burst = burst
         self.refill_per_second = refill_per_second
         self.enforce_limit = enforce_limit
-        # The live API returns the ENTIRE feed when `page` is omitted. Off by
-        # default so the existing tests keep exercising the paginated fallback;
-        # the single-request tests turn it on.
+        # The live API returns the ENTIRE feed when `page` is omitted. On by
+        # default because that is what production does; turn it off to force the
+        # paginated fallback.
         self.serve_full_feed = serve_full_feed
         self.tokens = float(burst)
         self.clock = 0.0
@@ -105,7 +125,26 @@ class FakeWootApi:
             self.tokens -= 1
 
         if "/feed/" in url:
-            if "page=" not in url and self.serve_full_feed:
+            name = url.split("/feed/")[1].split("?")[0]
+            page = int(url.split("page=")[1]) if "page=" in url else None
+
+            if name != "All":
+                start, count = CATEGORY_SLICES.get(name, (0, 0))
+                pages = max(1, -(-count // PAGE_SIZE))  # ceil
+                if page is None:
+                    # Categories always answer the non-paginated form in full.
+                    items = [make_item(start + i) for i in range(count)]
+                else:
+                    if page > pages or count == 0:
+                        return FakeResponse(404, None, text='"NotFound"')
+                    lo = (page - 1) * PAGE_SIZE
+                    items = [make_item(start + lo + i)
+                             for i in range(min(PAGE_SIZE, count - lo))]
+                return FakeResponse(200, {
+                    "Items": items, "MarketingName": name, "TotalPages": pages,
+                })
+
+            if page is None and self.serve_full_feed:
                 # Non-paginated mode: one response carrying the whole feed, while
                 # TotalPages still advertises the paginated count.
                 items = [make_item(i) for i in range(SERVED_PAGES * PAGE_SIZE)]
@@ -114,9 +153,7 @@ class FakeWootApi:
                     "MarketingName": "All",
                     "TotalPages": REPORTED_PAGES,
                 })
-            page = 1
-            if "page=" in url:
-                page = int(url.split("page=")[1])
+            page = page or 1
             if page > SERVED_PAGES:
                 return FakeResponse(404, None, text='"NotFound"')
             start = (page - 1) * PAGE_SIZE
@@ -229,6 +266,46 @@ class PipelineTest(PipelineTestBase):
         self.assertEqual(main.matched_keywords(None), [])
         self.assertEqual(main.matched_keywords(123), [])
 
+    def test_airtag_spellings_all_match(self):
+        """Woot sellers write AirTag several ways; all of them must match."""
+        for title in ["Apple AirTag 4 Pack",
+                      "Apple AirTag (1 Pack)",
+                      "Apple Air Tag Bluetooth Tracker",
+                      "Apple Air-Tag 4-Pack",
+                      "AirTags 4-Pack Bluetooth Item Finder",
+                      "apple airtag leather loop"]:
+            with self.subTest(title=title):
+                self.assertTrue(
+                    main.matched_keywords(title),
+                    f"{title!r} should have matched an AirTag keyword")
+
+    def test_real_sellout_airtag_listing_matches(self):
+        """
+        A listing that really appeared on Woot:
+        sellout.woot.com/offers/4-pack-apple-airtags-1st-gen-3
+
+        Note it is a SELLOUT offer. Those reach the tracker only through the
+        Clearance feed, not through All, so this is exactly the kind of deal
+        the multi-feed change exists to make visible.
+        """
+        item = {
+            "OfferId": "real-1",
+            "Title": "4-Pack: Apple AirTags (1st Gen)",
+            "Subtitle": None,
+            "Slug": "4-pack-apple-airtags-1st-gen-3",
+            "Categories": ["Electronics"],
+            "Url": "https://sellout.woot.com/offers/4-pack-apple-airtags-1st-gen-3",
+        }
+        self.assertTrue(main.improved_title_contains_keywords(item))
+        self.assertEqual(main.matched_keywords(item["Slug"]), ["airtag"])
+
+    def test_airtag_keywords_do_not_match_unrelated_offers(self):
+        for title in ["Cordless Air Compressor",
+                      "Gift Tag Assortment, 50 Count",
+                      "Air Fryer 6qt"]:
+            with self.subTest(title=title):
+                self.assertFalse(main.matched_keywords(title), title)
+
     def test_prefilter_tolerates_null_fields(self):
         item = make_item(4200)
         self.assertIsNone(item["Subtitle"])
@@ -236,10 +313,13 @@ class PipelineTest(PipelineTestBase):
         self.assertFalse(main.improved_title_contains_keywords(make_item(7)))
 
     # -- feed pagination -----------------------------------------------------
+    # These exercise the paginated fallback specifically, so they call it
+    # directly. Going through fetch_feed() would fetch all 11 feeds and test
+    # merging rather than paging.
 
     def test_feed_fetches_every_page_despite_rate_limit(self):
         main.start_run_budget()
-        items, complete = main.fetch_feed()
+        items, complete = main._fetch_feed_paginated()
         self.assertTrue(complete)
         self.assertEqual(len(items), PAGE_SIZE * SERVED_PAGES)
         # Normalised ID field is present for downstream code.
@@ -248,7 +328,7 @@ class PipelineTest(PipelineTestBase):
     def test_trailing_404_is_end_of_feed_not_a_failure(self):
         """The API advertises 51 pages but serves 50; the 404 must not read as truncation."""
         main.start_run_budget()
-        items, complete = main.fetch_feed()
+        items, complete = main._fetch_feed_paginated()
         self.assertTrue(complete)
         self.assertIn(("GET", f"{main.FEED_ENDPOINT}?page={SERVED_PAGES + 1}"), self.api.calls)
 
@@ -256,7 +336,7 @@ class PipelineTest(PipelineTestBase):
         main.start_run_budget()
         with mock.patch.object(main.requests, "request",
                                lambda *a, **k: FakeResponse(404, None, text='"NotFound"')):
-            items, complete = main.fetch_feed()
+            items, complete = main._fetch_feed_paginated()
         self.assertFalse(complete)
         self.assertEqual(items, [])
 
@@ -276,7 +356,7 @@ class PipelineTest(PipelineTestBase):
         blank = FakeResponse(200, {"Items": [], "TotalPages": REPORTED_PAGES})
         with mock.patch.object(main.requests, "request",
                                self._feed_with_override(3, blank)):
-            items, complete = main.fetch_feed()
+            items, complete = main._fetch_feed_paginated()
         self.assertFalse(complete)
         self.assertEqual(len(items), PAGE_SIZE * 2)
 
@@ -285,7 +365,7 @@ class PipelineTest(PipelineTestBase):
         blank = FakeResponse(200, {"Items": [], "TotalPages": REPORTED_PAGES})
         with mock.patch.object(main.requests, "request",
                                self._feed_with_override(REPORTED_PAGES, blank)):
-            items, complete = main.fetch_feed()
+            items, complete = main._fetch_feed_paginated()
         self.assertTrue(complete)
 
     def test_malformed_items_list_is_not_a_clean_end(self):
@@ -293,7 +373,7 @@ class PipelineTest(PipelineTestBase):
         bad = FakeResponse(200, {"Items": None, "TotalPages": REPORTED_PAGES})
         with mock.patch.object(main.requests, "request",
                                self._feed_with_override(3, bad)):
-            items, complete = main.fetch_feed()
+            items, complete = main._fetch_feed_paginated()
         self.assertFalse(complete)
 
     def test_404_mid_feed_is_a_failure_not_end_of_feed(self):
@@ -302,7 +382,7 @@ class PipelineTest(PipelineTestBase):
         missing = FakeResponse(404, None, text='"NotFound"')
         with mock.patch.object(main.requests, "request",
                                self._feed_with_override(3, missing)):
-            items, complete = main.fetch_feed()
+            items, complete = main._fetch_feed_paginated()
         self.assertFalse(complete)
         self.assertEqual(len(items), PAGE_SIZE * 2)
 
@@ -310,7 +390,7 @@ class PipelineTest(PipelineTestBase):
         main.start_run_budget()
         with mock.patch.object(main.requests, "request",
                                lambda *a, **k: FakeResponse(429, {"message": "Too Many Requests"})):
-            items, complete = main.fetch_feed()
+            items, complete = main._fetch_feed_paginated()
         self.assertFalse(complete)
         self.assertEqual(items, [])
 
@@ -323,7 +403,7 @@ class PipelineTest(PipelineTestBase):
         """
         main.start_run_budget()
         with mock.patch.object(main, "MIN_REQUEST_INTERVAL", 0.0):
-            items, complete = main.fetch_feed()
+            items, complete = main._fetch_feed_paginated()
 
         self.assertGreater(self.api.rate_limited, 0, "expected the fake API to rate limit")
         self.assertTrue(complete)
@@ -374,7 +454,7 @@ class PipelineTest(PipelineTestBase):
         self.assertIn("complete=True", result)
 
         seen = json.loads(self.store[main.SEEN_DEALS_FILENAME])["deals"]
-        self.assertEqual(len(seen), PAGE_SIZE * SERVED_PAGES)
+        self.assertEqual(len(seen), CATALOG_SIZE)
 
     def test_second_run_does_not_re_notify(self):
         self.run_check()
@@ -423,69 +503,117 @@ class PipelineTest(PipelineTestBase):
         self.assertTrue(self.alerts, "the user must be told the run could not start")
 
 
-class SingleRequestFeedTest(PipelineTestBase):
+class MultiFeedTest(PipelineTestBase):
     """
-    The feed is fetched in ONE request when the API allows it.
+    Every feed is fetched in ONE request each and merged into one catalogue.
 
-    This exists because polling 51 pages hourly needed 1224 requests/day against
-    a 1000/day quota, so the feed died every evening. One request per run makes
-    the quota a non-issue -- but only if the expensive fallback stays governed.
+    Two failures drive this. Polling 51 pages hourly needed 1224 requests/day
+    against a 1000/day quota, so the feed died every evening; and All is capped
+    at 5000 items, hiding ~60% of the catalogue including the Clearance and
+    Sellout offers where discounted e-readers appear.
     """
 
-    def test_whole_feed_arrives_in_a_single_request(self):
-        self.api.serve_full_feed = True
+    def test_every_feed_costs_exactly_one_request(self):
         items, complete = main.fetch_feed()
         self.assertTrue(complete)
-        self.assertEqual(len(items), SERVED_PAGES * PAGE_SIZE)
-        self.assertEqual(len(self.api.feed_requests()), 1,
-                         "the whole feed must cost exactly one request")
-        self.assertTrue(main._feed_stats.get("single_request"))
+        self.assertEqual(len(self.api.feed_requests()), len(main.FEED_NAMES),
+                         "one request per feed, no pagination")
+        self.assertEqual(main._feed_stats["feeds_ok"], len(main.FEED_NAMES))
+
+    def test_merged_catalogue_is_bigger_than_the_all_feed_alone(self):
+        items, complete = main.fetch_feed()
+        self.assertTrue(complete)
+        self.assertEqual(len(items), CATALOG_SIZE)
+        self.assertGreater(len(items), SERVED_PAGES * PAGE_SIZE,
+                           "categories must recover offers All cannot reach")
+
+    def test_offers_appearing_in_several_feeds_are_deduplicated(self):
+        items, _ = main.fetch_feed()
+        ids = [i["OfferId"] for i in items]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_empty_feeds_are_not_failures(self):
+        # Gourmet and Wootoff really are empty; an empty feed is an answer.
+        items, complete = main.fetch_feed()
+        self.assertTrue(complete)
+        self.assertEqual(main._feed_stats["feeds_failed"], 0)
 
     def test_ids_are_normalised_on_the_single_request_path_too(self):
-        self.api.serve_full_feed = True
         items, _ = main.fetch_feed()
         self.assertTrue(all(i["Id"] == i["OfferId"] for i in items))
 
-    def test_page_count_check_does_not_fire_on_a_single_request_run(self):
-        # pages_fetched is 1 while TotalPages still says 51. Comparing the two
-        # would flag every healthy run, so the check must be skipped here.
-        self.api.serve_full_feed = True
+    def test_healthy_multi_feed_run_raises_no_problems(self):
         self.run_check()
         kinds = [e["kind"] for e in main._health_events]
-        self.assertNotIn("feed_pages_too_few", kinds)
+        self.assertNotIn("feed_coverage_partial", kinds)
         self.assertNotIn("feed_incomplete", kinds)
-
-    def test_single_request_run_is_reported_healthy(self):
-        self.api.serve_full_feed = True
-        self.run_check()
-        self.assertEqual(self.health_state().get("consecutive_bad_runs"), 0)
+        self.assertNotIn("feed_too_small", kinds)
         self.assertEqual(self.alerts, [])
 
+    def test_one_failing_feed_makes_the_run_incomplete(self):
+        # A partial catalogue must never let unseen offers be marked seen.
+        real = self.api.request
+
+        def request(method, url, **kwargs):
+            if "/feed/Sports" in url:
+                return FakeResponse(500, {"message": "boom"})
+            return real(method, url, **kwargs)
+
+        main.start_run_budget()
+        with mock.patch.object(main.requests, "request", request):
+            items, complete = main.fetch_feed()
+        self.assertFalse(complete, "a missing feed means an incomplete read")
+        self.assertGreater(main._feed_stats["feeds_failed"], 0)
+
+    def test_partial_coverage_is_reported(self):
+        real = self.api.request
+
+        def request(method, url, **kwargs):
+            if "/feed/Tools" in url:
+                return FakeResponse(500, {"message": "boom"})
+            return real(method, url, **kwargs)
+
+        with mock.patch.object(main.requests, "request", request):
+            self.run_check()
+        self.assertIn("feed_coverage_partial",
+                      [e["kind"] for e in main._health_events])
+
+    def test_regressing_to_all_only_coverage_trips_the_size_floor(self):
+        # The most likely silent failure: categories stop working and only All
+        # answers. 5000 items looks plausible, so the floor sits above it.
+        self.assertGreater(main.FEED_SIZE_FLOOR, SERVED_PAGES * PAGE_SIZE)
+
     def test_short_single_response_falls_back_to_pagination(self):
-        # serve_full_feed is off, so the un-paged call returns only one page.
-        # That is implausibly short and must not be trusted as the whole feed.
+        # With serve_full_feed off, All's un-paged call returns just one page
+        # while advertising 51. That must not be trusted as the whole feed.
+        self.api.serve_full_feed = False
+        main.start_run_budget()
         items, complete = main.fetch_feed()
         self.assertTrue(complete)
-        self.assertEqual(len(items), SERVED_PAGES * PAGE_SIZE)
-        self.assertGreater(len(self.api.feed_requests()), 1,
+        self.assertEqual(len(items), CATALOG_SIZE)
+        self.assertGreater(len(self.api.feed_requests()), len(main.FEED_NAMES),
                            "a short single response must fall back to paging")
-        self.assertFalse(main._feed_stats.get("single_request"))
 
     def test_fallback_is_refused_when_the_day_is_nearly_spent(self):
-        # The fallback costs ~51 requests. Spending it 96 times a day would
-        # recreate exactly the overrun this change removes.
+        # The fallback costs ~51 requests per feed. Spending it on 11 feeds 48
+        # times a day would burn 26000 requests against a 1000/day quota, which
+        # is exactly the overrun this whole design exists to prevent.
+        self.api.serve_full_feed = False  # forces All to want the fallback
         self.store[main.HEALTH_STATE_FILENAME] = json.dumps({
             "quota": {"date": main._utc_today(),
                       "used": main.DAILY_REQUEST_CEILING - 5},
         })
         main.start_run_budget()  # how a real run loads the day's prior spend
         items, complete = main.fetch_feed()
-        self.assertEqual(items, [])
-        self.assertFalse(complete)
+
+        self.assertFalse(complete, "a refused fallback means an incomplete read")
         self.assertIn("feed_fallback_skipped",
                       [e["kind"] for e in main._health_events])
-        self.assertLessEqual(len(self.api.feed_requests()), 2,
-                             "the refused fallback must not page the feed anyway")
+        # The categories still answered, so their offers are kept; only All,
+        # which needed the expensive retry, is missing.
+        self.assertLess(len(items), CATALOG_SIZE)
+        self.assertNotIn(("GET", f"{main.FEED_ENDPOINT}?page=2"), self.api.calls,
+                         "the refused fallback must not page the feed anyway")
 
     def test_yesterdays_quota_does_not_count_against_today(self):
         self.store[main.HEALTH_STATE_FILENAME] = json.dumps({
@@ -523,6 +651,9 @@ class HealthAlertingTest(PipelineTestBase):
 
     def test_truncated_feed_is_reported_even_though_the_run_succeeds(self):
         """The original bug: a run that completes but silently read a fraction of the feed."""
+        # Force the paginated path: the failure being reproduced is mid-pagination
+        # truncation, and a single-request fetch has no page boundary to cut at.
+        self.api.serve_full_feed = False
         main.start_run_budget()
         truncate_after = 13  # where the live service used to give up
 
@@ -636,11 +767,11 @@ class HealthAlertingTest(PipelineTestBase):
     def test_feed_shrinking_against_its_own_history_is_flagged(self):
         self._establish_baseline()
         sizes = self.health_state()["recent_feed_sizes"]
-        self.assertEqual(main.feed_baseline(self.health_state()), PAGE_SIZE * SERVED_PAGES)
+        self.assertEqual(main.feed_baseline(self.health_state()), CATALOG_SIZE)
 
-        # 33 complete pages: above the absolute floor, below 70% of the median,
-        # so this isolates the ratio check from the floor and page checks.
-        with mock.patch.object(main.requests, "request", self._serve_pages(33)):
+        # 70 complete pages = 7000 items: above the 6000 floor but below 70% of
+        # the 12000 median, so this isolates the ratio check from the floor.
+        with mock.patch.object(main.requests, "request", self._serve_pages(70)):
             body, _ = self.run_check()
 
         self.assertIn("health: degraded", body)
@@ -671,8 +802,13 @@ class HealthAlertingTest(PipelineTestBase):
         self.assertIn("health: degraded", body)
         self.assertTrue(any("feed_schema_invalid" in a[0] for a in self.alerts))
 
-    def test_repeated_page_one_is_caught_by_duplicate_ids(self):
-        """Pagination being ignored inflates the item count, evading every size check."""
+    def test_repeated_page_one_collapses_instead_of_inflating(self):
+        """
+        A feed that serves page one over and over used to inflate the item count
+        to 5000 duplicates and sail past every size check. Merging by offer id
+        makes that inflation structurally impossible: the same 100 offers now
+        collapse to 100 distinct ones, which trips the size floor instead.
+        """
         def request(method, url, **kwargs):
             if "/feed/" in url:
                 return FakeResponse(200, {
@@ -684,10 +820,9 @@ class HealthAlertingTest(PipelineTestBase):
         with mock.patch.object(main.requests, "request", request):
             body, _ = self.run_check()
 
-        self.assertIn("feed_items=5000", body.replace("Feed items: ", "feed_items="))
+        self.assertIn("feed_items=100", body.replace("Feed items: ", "feed_items="))
         self.assertIn("health: degraded", body)
-        self.assertTrue(any("feed_duplicate_ids" in a[0] for a in self.alerts),
-                        f"got {[a[0] for a in self.alerts]}")
+        self.assertIn("feed_too_small", [e["kind"] for e in main._health_events])
 
     def test_feed_losing_its_title_text_is_flagged(self):
         """The matcher would silently match nothing while every count stayed green."""

@@ -21,9 +21,29 @@ logging.basicConfig(
 
 # Configuration (use environment variables for sensitive data)
 WOOT_API_KEY = os.environ.get("WOOT_API_KEY")
-FEED_ENDPOINT = "https://developer.woot.com/feed/All"  # Changed to All to search everything
+FEED_BASE = "https://developer.woot.com/feed"
+FEED_ENDPOINT = f"{FEED_BASE}/All"  # kept for the connectivity self-tests
+
+# The All feed is capped at 5000 items by Woot, but the catalog is ~12400, so
+# All alone shows about 40% of it. The per-category feeds together are a strict
+# superset -- measured: every offer in All also appears in some category, while
+# 7445 offers appear ONLY in a category. Clearance and Sellout in particular are
+# where discounted e-readers land, so polling All alone can hide exactly the
+# deals this tracker exists to find.
+FEED_NAMES = ["All", "Clearance", "Computers", "Electronics", "Featured",
+              "Home", "Gourmet", "Shirts", "Sports", "Tools", "Wootoff"]
+
+# The API serves 100 items per page and does not let you change it. Used to spot
+# a non-paginated request that came back paginated anyway.
+FEED_PAGE_SIZE = 100
+
 GETOFFERS_ENDPOINT = "https://developer.woot.com/getoffers"
-KEYWORDS = ["kindle", "ereader", "e-reader", "e-ink", "kobo", "nook", "eink"]
+KEYWORDS = ["kindle", "ereader", "e-reader", "e-ink", "kobo", "nook", "eink",
+            "airtag", "air-tag"]
+# Both AirTag spellings are listed for the same reason as ereader/e-reader:
+# normalize_text flattens hyphens, so "air-tag" covers "Air Tag" and
+# "Air-Tag" while "airtag" covers Apple's own one-word branding. Matching is
+# substring, so "airtag" also picks up the "AirTags" plural on its own.
 
 
 def normalize_text(text):
@@ -98,10 +118,13 @@ HEALTH_STATE_FILENAME = "health_state.json"
 # which is the only way to catch the service not running at all.
 HEALTH_MARKER = "WOOT_HEALTH"
 
-# A healthy feed is ~5000 items over 50 pages. The floor has to sit ABOVE the
-# failure it exists to catch: the original truncation returned ~1300 items, so a
-# floor of 1000 would have sat silently through the very bug it was added for.
-FEED_SIZE_FLOOR = 3000
+# Merging all the category feeds yields ~12400 distinct offers. The floor has to
+# sit ABOVE the failure it exists to catch: the original truncation returned
+# ~1300 items, so a floor of 1000 would have sat silently through the very bug it
+# was added for. 6000 is deliberately chosen to sit just above the 5000 that the
+# All feed alone returns, so silently regressing to All-only coverage -- the most
+# likely way this breaks -- trips the floor instead of looking healthy.
+FEED_SIZE_FLOOR = 6000
 
 # A drop against the recent norm catches a shrink that never crosses the floor.
 # The baseline is the median of recent healthy runs, not the largest ever seen: a
@@ -115,7 +138,6 @@ FEED_BASELINE_MIN_SAMPLES = 6  # below this the ratio check is not evaluated
 # Contract checks on the feed's shape. These catch the case where every pipe
 # works and the content is wrong -- the class the original bug belonged to.
 FEED_MIN_TITLE_RATIO = 0.95     # feed items carrying usable title text
-FEED_MAX_DUPLICATE_RATIO = 0.05 # duplicate offer ids; should be ~0
 
 # The seen-index should sit near the live catalogue size plus recent churn.
 SEEN_STATE_MIN = 500
@@ -1034,90 +1056,153 @@ def _read_feed_payload(response, label):
             f"Feed {label} has no usable Items list "
             f"(got {type(item_list).__name__})"
         )
-        return None
-    return item_list
+        return None, 0
+    return item_list, (reported_pages if isinstance(reported_pages, int) else 0)
 
 
-def _fetch_feed_single():
+def _fetch_one_feed_single(feed_name):
     """
-    Fetch the whole feed in ONE request by omitting the `page` parameter.
+    Fetch one named feed in ONE request by omitting the `page` parameter.
 
-    This is the cheap path and the reason the daily quota is no longer a
-    constraint: the same ~5000 items that cost 51 paginated requests cost 1 here.
-    Returns (items, ok); ok is False when the response was missing, malformed or
-    implausibly short, which sends the caller to the paginated fallback.
+    This is the cheap path and the reason the daily quota stopped being a
+    constraint: what costs 51 paginated requests costs 1 here.
+
+    Returns (items, ok). There is deliberately NO minimum item count: the feeds
+    are legitimately different sizes (Featured had 9 items, Gourmet 0, Home
+    5000), so a size floor here would send small feeds into a pointless
+    paginated fallback. Truncation is detected by comparing against TotalPages
+    instead, and the merged total is size-checked by check_feed_health.
     """
-    response = woot_request("GET", FEED_ENDPOINT)
+    response = woot_request("GET", f"{FEED_BASE}/{feed_name}")
     if response is None:
-        logging.warning("Single-request feed fetch failed; will consider fallback")
+        logging.warning(f"Single-request fetch of feed '{feed_name}' failed")
         return [], False
 
-    item_list = _read_feed_payload(response, "single-request response")
+    item_list, reported_pages = _read_feed_payload(response, f"'{feed_name}'")
     if item_list is None:
         return [], False
 
     items = _normalise_items(item_list)
-    # A short answer here means the endpoint quietly changed behaviour (for
-    # instance starting to paginate). Treat it as a miss and let the paginated
-    # path prove what the feed really holds, rather than trusting a partial read.
-    if len(items) < FEED_SIZE_FLOOR:
+
+    # The non-paginated form should return everything at once. Getting back a
+    # single page's worth while TotalPages advertises more means the endpoint
+    # started paginating on us, and trusting it would silently cost ~98% of
+    # this feed's offers.
+    if reported_pages > 1 and len(items) <= FEED_PAGE_SIZE:
         logging.warning(
-            f"Single-request fetch returned only {len(items)} items "
-            f"(below the {FEED_SIZE_FLOOR} floor); falling back to pagination"
+            f"Feed '{feed_name}' returned {len(items)} items but reports "
+            f"{reported_pages} pages; treating as paginated, not whole"
         )
         return [], False
 
-    _feed_stats["single_request"] = True
-    _feed_stats["pages_fetched"] = 1
-    logging.info(f"Fetched {len(items)} feed items in a single request")
+    logging.info(
+        f"Feed '{feed_name}': {len(items)} items in one request "
+        f"(reports {reported_pages} pages)"
+    )
     return items, True
+
+
+def _fetch_feed_with_fallback(feed_name):
+    """
+    Fetch one feed, falling back to pagination only if the day can afford it.
+
+    The fallback costs ~51 requests against a 1000/day quota. Spending it on
+    every feed of every run would burn 5000+/day and recreate exactly the
+    silent overrun this design exists to prevent, so it is gated on the budget.
+    """
+    items, ok = _fetch_one_feed_single(feed_name)
+    if ok:
+        return items, True
+
+    if quota_remaining() < PAGINATED_FETCH_COST:
+        logging.error(
+            f"Skipping paginated fallback for '{feed_name}': only "
+            f"{quota_remaining()} requests left under today's ceiling of "
+            f"{DAILY_REQUEST_CEILING}, need ~{PAGINATED_FETCH_COST}"
+        )
+        record_health_event(
+            "feed_fallback_skipped",
+            f"the single-request fetch of '{feed_name}' failed and the day's "
+            f"remaining request budget ({quota_remaining()}) could not afford "
+            f"the paginated retry"
+        )
+        return [], False
+
+    logging.warning(f"Falling back to paginated fetch for feed '{feed_name}'")
+    return _fetch_feed_paginated(feed_name)
 
 
 def fetch_feed():
     """
-    Fetch the Woot feed, cheaply when possible.
+    Fetch every Woot feed and merge them into one deduplicated catalogue.
 
-    Tries the single-request form first (1 request), falling back to paginated
-    reads (51 requests) only when that fails AND the day's request budget can
-    still afford it. Without that budget check the fallback would be a way to
-    silently spend 51x the intended quota on every run -- the same failure this
-    whole change exists to remove.
+    All alone is capped at 5000 items and hides roughly 60% of the catalogue,
+    including the Clearance and Sellout offers where discounted e-readers turn
+    up. The category feeds together are a superset, so they are all polled and
+    merged by offer id.
 
-    Returns (items, complete). `complete` is False when the feed was cut short,
-    so the caller can avoid recording offers it never looked at as "seen".
+    Returns (items, complete). `complete` is False when ANY feed could not be
+    read, so the caller does not record offers it never looked at as "seen" --
+    a partial read must never let unseen offers be marked seen.
     """
-    logging.info("Fetching feed from Woot API")
+    logging.info(f"Fetching {len(FEED_NAMES)} Woot feeds")
 
     _feed_stats.clear()
     _feed_stats.update({"pages_fetched": 0, "reported_pages": 0,
                         "rate_limit_hits": 0, "schema_ok": True,
-                        "single_request": False})
+                        "feeds_ok": 0, "feeds_failed": 0, "raw_items": 0})
 
-    items, ok = _fetch_feed_single()
-    if ok:
-        return items, True
+    merged = {}
+    failed = []
 
-    # The fallback is expensive. Only spend it if today can still spare it.
-    if quota_remaining() < PAGINATED_FETCH_COST:
+    for feed_name in FEED_NAMES:
+        # Leave room for the detail fetch rather than spending the whole run on
+        # feeds; the remaining ones are picked up next run.
+        if budget_remaining() < FEED_BUDGET_RESERVE:
+            logging.error(
+                f"Run budget exhausted before feed '{feed_name}'; "
+                f"{len(FEED_NAMES) - len(failed) - _feed_stats['feeds_ok']} feeds unread"
+            )
+            failed.append(feed_name)
+            continue
+
+        items, ok = _fetch_feed_with_fallback(feed_name)
+
+        # Keep whatever a partial read did return. A feed that was cut short
+        # still yields real offers, and dropping them would hide deals for no
+        # gain -- `complete` below is what stops unseen offers being recorded
+        # as seen, so partial data is safe to use but not safe to trust as whole.
+        _feed_stats["raw_items"] += len(items)
+        for item in items:
+            offer_id = item.get("OfferId") or item.get("Id")
+            if offer_id:
+                merged[offer_id] = item
+
+        if ok:
+            _feed_stats["feeds_ok"] += 1
+        else:
+            failed.append(feed_name)
+            _feed_stats["feeds_failed"] += 1
+
+    all_items = list(merged.values())
+    complete = not failed
+    if failed:
         logging.error(
-            f"Skipping paginated fallback: only {quota_remaining()} requests left "
-            f"under today's ceiling of {DAILY_REQUEST_CEILING}, "
-            f"need ~{PAGINATED_FETCH_COST}"
+            f"Feeds that could not be read: {', '.join(failed)}; "
+            f"marking this run incomplete so nothing unseen is recorded as seen"
         )
-        record_health_event(
-            "feed_fallback_skipped",
-            f"the single-request fetch failed and the day's remaining request "
-            f"budget ({quota_remaining()}) could not afford the paginated retry"
-        )
-        return [], False
 
-    logging.warning("Falling back to paginated feed fetch")
-    return _fetch_feed_paginated()
+    logging.info(
+        f"Merged {_feed_stats['raw_items']} items from "
+        f"{_feed_stats['feeds_ok']}/{len(FEED_NAMES)} feeds into "
+        f"{len(all_items)} distinct offers, complete={complete}"
+    )
+    return all_items, complete
 
 
-def _fetch_feed_paginated():
+def _fetch_feed_paginated(feed_name="All"):
     """
-    Fetch the feed one page at a time -- the original, expensive path.
+    Fetch one feed a page at a time -- the original, expensive path.
 
     Kept as a fallback so a change in the single-request endpoint degrades to
     something proven rather than to nothing.
@@ -1136,7 +1221,7 @@ def _fetch_feed_paginated():
             complete = False
             break
 
-        page_url = f"{FEED_ENDPOINT}?page={current_page}"
+        page_url = f"{FEED_BASE}/{feed_name}?page={current_page}"
         response = woot_request("GET", page_url, accept_statuses=(200, 404))
         if response is None:
             logging.error(f"Failed to fetch feed page {current_page}/{total_pages}")
@@ -1162,15 +1247,18 @@ def _fetch_feed_paginated():
 
         # A malformed page is an API shape change, not the end of the feed, so it
         # must never masquerade as a complete read.
-        item_list = _read_feed_payload(response, f"page {current_page}")
+        item_list, reported_pages = _read_feed_payload(
+            response, f"'{feed_name}' page {current_page}")
         if item_list is None:
             complete = False
             break
 
+        # Use THIS feed's page count, not _feed_stats["reported_pages"], which is
+        # the maximum across every feed -- paginating Shirts (3 pages) against
+        # All's 51 would chase 48 pages that do not exist.
         # Without a usable TotalPages the loop would read page 1, find total_pages
         # still at its initial 1, and exit reporting a complete feed of 100 items.
         # _read_feed_payload already flagged that as a schema problem.
-        reported_pages = _feed_stats.get("reported_pages", 0)
         if reported_pages:
             if reported_pages > MAX_FEED_PAGES:
                 logging.warning(
@@ -1652,8 +1740,9 @@ def _run_deal_check():
 
     check_feed_health(len(feed_items), feed_ids, feed_items, feed_complete)
 
+    metrics["feeds"] = f"{_feed_stats.get('feeds_ok', 0)}/{len(FEED_NAMES)}"
+    metrics["raw_items"] = _feed_stats.get("raw_items", 0)
     metrics["pages"] = _feed_stats.get("pages_fetched", 0)
-    metrics["reported_pages"] = _feed_stats.get("reported_pages", 0)
     metrics["rate_limit_hits"] = _feed_stats.get("rate_limit_hits", 0)
     metrics["canary_hits"] = count_canary_hits(feed_items)
     metrics["new_items"] = len(feed_ids) - already_seen
@@ -1787,17 +1876,17 @@ def check_feed_health(feed_items, feed_ids, items, feed_complete):
     # Did we actually read the whole feed? Page count is a far finer measure of
     # truncation than item count. The -1 allows for the known off-by-one where
     # the API advertises one more page than it serves.
-    # Page count is meaningless for a single-request fetch: one response carries
-    # the whole feed while TotalPages still advertises 51. Comparing them there
-    # would flag every healthy run. The item-count checks below still apply, and
-    # they are what actually detect a short read on this path.
-    pages = _feed_stats.get("pages_fetched", 0)
-    reported = _feed_stats.get("reported_pages", 0)
-    if (not _feed_stats.get("single_request")
-            and feed_complete and reported and pages < reported - 1):
+    # Coverage is now counted in feeds, not pages: one request returns a whole
+    # feed, so page count says nothing about completeness. Truncation of an
+    # individual feed is caught at fetch time by comparing its item count against
+    # its own TotalPages, which marks that feed failed and the run incomplete.
+    feeds_ok = _feed_stats.get("feeds_ok", 0)
+    feeds_failed = _feed_stats.get("feeds_failed", 0)
+    if feeds_ok and feeds_ok < len(FEED_NAMES):
         record_health_event(
-            "feed_pages_too_few",
-            f"read {pages} of {reported} pages but the feed reported itself complete"
+            "feed_coverage_partial",
+            f"read {feeds_ok} of {len(FEED_NAMES)} feeds "
+            f"({feeds_failed} failed); the catalogue seen this run is incomplete"
         )
 
     if feed_items < FEED_SIZE_FLOOR:
@@ -1806,16 +1895,12 @@ def check_feed_health(feed_items, feed_ids, items, feed_complete):
             f"only {feed_items} items, expected at least {FEED_SIZE_FLOOR}"
         )
 
-    # Duplicate ids are the one signal that catches pagination being ignored --
-    # that failure inflates the item count and so evades every size check.
-    if feed_ids:
-        duplicates = len(feed_ids) - len(set(feed_ids))
-        if duplicates > len(feed_ids) * FEED_MAX_DUPLICATE_RATIO:
-            record_health_event(
-                "feed_duplicate_ids",
-                f"{duplicates} of {len(feed_ids)} offers are duplicates; "
-                f"pagination may be returning the same page repeatedly"
-            )
+    # There is deliberately no duplicate-id check any more. It existed to catch
+    # pagination silently returning the same page, which inflated the item count
+    # past every size check. Feeds are now merged into a dict keyed by offer id,
+    # so that inflation cannot happen: repeated pages collapse to the distinct
+    # offers they contain and the collapse trips FEED_SIZE_FLOOR instead. Keeping
+    # the check would only suggest a protection that can no longer fire.
 
     # If the feed stops carrying title text, the matcher matches nothing while
     # every count, page and status stays green -- the original bug's twin.
@@ -1833,10 +1918,15 @@ def check_feed_health(feed_items, feed_ids, items, feed_complete):
             f"Feed fetch absorbed {_feed_stats['rate_limit_hits']} rate-limit responses"
         )
 
+    # Still worth watching even though a healthy run no longer paginates: this is
+    # what the paginated FALLBACK would have to get through, so once it outgrows
+    # the run budget the fallback has quietly stopped being a real safety net.
+    reported = _feed_stats.get("reported_pages", 0)
     if reported > FEED_PAGES_WARN:
         record_health_event(
             "feed_outgrowing_budget",
-            f"the feed now reports {reported} pages; the run budget supports about "
+            f"the largest feed now reports {reported} pages; the run budget "
+            f"supports about "
             f"{int((RUN_BUDGET_SECONDS - FEED_BUDGET_RESERVE) / MIN_REQUEST_INTERVAL)}"
         )
 
