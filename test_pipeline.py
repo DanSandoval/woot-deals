@@ -67,14 +67,22 @@ class FakeResponse:
 class FakeWootApi:
     """Token-bucket rate limiter matching the behaviour seen in production logs."""
 
-    def __init__(self, burst=10, refill_per_second=1.0, enforce_limit=True):
+    def __init__(self, burst=10, refill_per_second=1.0, enforce_limit=True,
+                 serve_full_feed=False):
         self.burst = burst
         self.refill_per_second = refill_per_second
         self.enforce_limit = enforce_limit
+        # The live API returns the ENTIRE feed when `page` is omitted. Off by
+        # default so the existing tests keep exercising the paginated fallback;
+        # the single-request tests turn it on.
+        self.serve_full_feed = serve_full_feed
         self.tokens = float(burst)
         self.clock = 0.0
         self.calls = []
         self.rate_limited = 0
+
+    def feed_requests(self):
+        return [u for _, u in self.calls if "/feed/" in u]
 
     # -- fake clock, so tests do not actually sleep --------------------------
     def monotonic(self):
@@ -97,6 +105,15 @@ class FakeWootApi:
             self.tokens -= 1
 
         if "/feed/" in url:
+            if "page=" not in url and self.serve_full_feed:
+                # Non-paginated mode: one response carrying the whole feed, while
+                # TotalPages still advertises the paginated count.
+                items = [make_item(i) for i in range(SERVED_PAGES * PAGE_SIZE)]
+                return FakeResponse(200, {
+                    "Items": items,
+                    "MarketingName": "All",
+                    "TotalPages": REPORTED_PAGES,
+                })
             page = 1
             if "page=" in url:
                 page = int(url.split("page=")[1])
@@ -404,6 +421,95 @@ class PipelineTest(PipelineTestBase):
         self.assertEqual(status, 503, "a hard failure must not look green to Cloud Scheduler")
         self.assertEqual(self.sent, [])
         self.assertTrue(self.alerts, "the user must be told the run could not start")
+
+
+class SingleRequestFeedTest(PipelineTestBase):
+    """
+    The feed is fetched in ONE request when the API allows it.
+
+    This exists because polling 51 pages hourly needed 1224 requests/day against
+    a 1000/day quota, so the feed died every evening. One request per run makes
+    the quota a non-issue -- but only if the expensive fallback stays governed.
+    """
+
+    def test_whole_feed_arrives_in_a_single_request(self):
+        self.api.serve_full_feed = True
+        items, complete = main.fetch_feed()
+        self.assertTrue(complete)
+        self.assertEqual(len(items), SERVED_PAGES * PAGE_SIZE)
+        self.assertEqual(len(self.api.feed_requests()), 1,
+                         "the whole feed must cost exactly one request")
+        self.assertTrue(main._feed_stats.get("single_request"))
+
+    def test_ids_are_normalised_on_the_single_request_path_too(self):
+        self.api.serve_full_feed = True
+        items, _ = main.fetch_feed()
+        self.assertTrue(all(i["Id"] == i["OfferId"] for i in items))
+
+    def test_page_count_check_does_not_fire_on_a_single_request_run(self):
+        # pages_fetched is 1 while TotalPages still says 51. Comparing the two
+        # would flag every healthy run, so the check must be skipped here.
+        self.api.serve_full_feed = True
+        self.run_check()
+        kinds = [e["kind"] for e in main._health_events]
+        self.assertNotIn("feed_pages_too_few", kinds)
+        self.assertNotIn("feed_incomplete", kinds)
+
+    def test_single_request_run_is_reported_healthy(self):
+        self.api.serve_full_feed = True
+        self.run_check()
+        self.assertEqual(self.health_state().get("consecutive_bad_runs"), 0)
+        self.assertEqual(self.alerts, [])
+
+    def test_short_single_response_falls_back_to_pagination(self):
+        # serve_full_feed is off, so the un-paged call returns only one page.
+        # That is implausibly short and must not be trusted as the whole feed.
+        items, complete = main.fetch_feed()
+        self.assertTrue(complete)
+        self.assertEqual(len(items), SERVED_PAGES * PAGE_SIZE)
+        self.assertGreater(len(self.api.feed_requests()), 1,
+                           "a short single response must fall back to paging")
+        self.assertFalse(main._feed_stats.get("single_request"))
+
+    def test_fallback_is_refused_when_the_day_is_nearly_spent(self):
+        # The fallback costs ~51 requests. Spending it 96 times a day would
+        # recreate exactly the overrun this change removes.
+        self.store[main.HEALTH_STATE_FILENAME] = json.dumps({
+            "quota": {"date": main._utc_today(),
+                      "used": main.DAILY_REQUEST_CEILING - 5},
+        })
+        main.start_run_budget()  # how a real run loads the day's prior spend
+        items, complete = main.fetch_feed()
+        self.assertEqual(items, [])
+        self.assertFalse(complete)
+        self.assertIn("feed_fallback_skipped",
+                      [e["kind"] for e in main._health_events])
+        self.assertLessEqual(len(self.api.feed_requests()), 2,
+                             "the refused fallback must not page the feed anyway")
+
+    def test_yesterdays_quota_does_not_count_against_today(self):
+        self.store[main.HEALTH_STATE_FILENAME] = json.dumps({
+            "quota": {"date": "2000-01-01", "used": 999999},
+        })
+        main.start_run_budget()
+        self.assertEqual(main.load_quota_used(), 0)
+        self.assertEqual(main.quota_remaining(), main.DAILY_REQUEST_CEILING)
+
+    def test_quota_usage_accumulates_across_runs(self):
+        self.api.serve_full_feed = True
+        self.run_check()
+        after_first = self.health_state()["quota"]["used"]
+        self.assertGreater(after_first, 0)
+        self.assertEqual(self.health_state()["quota"]["date"], main._utc_today())
+
+        self.run_check()
+        self.assertGreater(self.health_state()["quota"]["used"], after_first,
+                           "each run must add its spend to the running total")
+
+    def test_unreadable_quota_state_does_not_break_the_run(self):
+        with mock.patch.object(main, "load_health_state",
+                               side_effect=RuntimeError("store down")):
+            self.assertEqual(main.load_quota_used(), 0)
 
 
 class HealthAlertingTest(PipelineTestBase):

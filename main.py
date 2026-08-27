@@ -62,6 +62,19 @@ REQUEST_TIMEOUT = 30  # seconds
 MIN_REQUEST_INTERVAL = 1.25  # seconds between any two Woot API requests
 DETAIL_BATCH_SIZE = 10  # offer IDs per getoffers call
 
+# The API also enforces a hard 1000 requests/day that resets at 00:00 UTC
+# (documented at developer.woot.com). This is a separate limit from the rate
+# above, and pacing cannot help once it is gone: the day is simply over. It went
+# unnoticed for months because polling 51 pages hourly needs 1224/day -- 22% over
+# -- so the feed died every evening and recovered by itself at midnight.
+WOOT_DAILY_QUOTA = 1000
+# Stop well short of the real ceiling. The gap absorbs retries and leaves the
+# later runs of the day enough budget to still fetch offer details.
+DAILY_REQUEST_CEILING = 800
+# What one full paginated crawl costs: ~51 pages plus retries. Used to decide
+# whether the day can still afford the fallback path.
+PAGINATED_FETCH_COST = 55
+
 # Cloud Scheduler gives this service a limited attempt deadline. Staying inside
 # it matters: an overrunning request gets retried by the scheduler, which would
 # only burn more rate-limit budget.
@@ -150,6 +163,12 @@ app = Flask(__name__)
 # Shared request pacing and per-run budget state
 _last_request_time = 0.0
 _run_deadline = None
+
+# Woot API requests made during this run, counted against the daily quota.
+_request_count = 0
+
+# Requests earlier runs already spent today, read once at the start of a run.
+_quota_prior = 0
 
 # Problems recorded during the current run, drained by report_run_health()
 _health_events = []
@@ -562,6 +581,47 @@ def load_health_state():
         return {}
 
 
+def _utc_today():
+    """The quota's day. It rolls at 00:00 UTC, not in any local timezone."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def load_quota_used():
+    """
+    Requests already spent against today's Woot quota by earlier runs.
+
+    A record from any earlier day is stale -- the quota reset at midnight UTC --
+    so it starts over at zero rather than carrying yesterday's total forward.
+    """
+    # Never raises: quota bookkeeping must not be able to break the job, same
+    # rule the rest of the health code follows. Falling back to 0 can at worst
+    # permit one extra paginated fallback (~51 requests) against an 800 ceiling,
+    # whereas assuming the quota is spent would refuse to run at all.
+    try:
+        quota = (load_health_state().get("quota") or {})
+        if quota.get("date") != _utc_today():
+            return 0
+        return max(0, int(quota.get("used", 0)))
+    except Exception as e:
+        logging.warning(f"Could not read quota usage, assuming none spent: {e}")
+        return 0
+
+
+def quota_spent():
+    """Requests spent against today's quota, including this run so far."""
+    return _quota_prior + _request_count
+
+
+def quota_remaining():
+    """
+    Requests left before this run should stop spending.
+
+    Measured against DAILY_REQUEST_CEILING rather than the true 1000, so there is
+    always headroom left for the rest of the day.
+    """
+    return DAILY_REQUEST_CEILING - quota_spent()
+
+
 def save_health_state(state):
     """Persist the cross-run health record. Best effort."""
     try:
@@ -724,6 +784,23 @@ def _report_run_health(status, metrics):
 
     status, kinds, state = _apply_staleness_check(status, kinds, state, metrics)
 
+    # Carry the day's request spend forward so the next run knows what is left.
+    # Keyed by UTC date because that is when the Woot quota resets; a record from
+    # an earlier day is stale and starts over rather than accumulating forever.
+    today = _utc_today()
+    quota = state.get("quota") or {}
+    try:
+        prior = int(quota.get("used", 0)) if quota.get("date") == today else 0
+    except (TypeError, ValueError):
+        prior = 0
+    state["quota"] = {"date": today, "used": prior + _request_count}
+
+    # Both go in the summary line. The daily quota is the limit that actually
+    # took this service down, so it belongs in routine output where a trend is
+    # visible, not only in the error that fires once it is already gone.
+    metrics["requests"] = _request_count
+    metrics["quota_used"] = f"{prior + _request_count}/{WOOT_DAILY_QUOTA}"
+
     # One machine-readable line per run. Cloud Monitoring keys off this: a metric
     # counts status=failed/degraded, and an absence policy fires when no
     # status=ok appears for hours -- the only way to detect the service not
@@ -804,9 +881,15 @@ def _report_run_health(status, metrics):
 
 
 def start_run_budget():
-    """Begin the wall-clock budget for one scheduled run."""
-    global _run_deadline
+    """Begin the wall-clock and daily-quota budgets for one scheduled run."""
+    global _run_deadline, _request_count, _quota_prior
     _run_deadline = time.monotonic() + RUN_BUDGET_SECONDS
+    _request_count = 0
+    _quota_prior = load_quota_used()
+    logging.info(
+        f"Run starting with {_quota_prior}/{DAILY_REQUEST_CEILING} of today's "
+        f"request ceiling already spent (hard quota {WOOT_DAILY_QUOTA}/day)"
+    )
 
 
 def end_run_budget():
@@ -861,6 +944,11 @@ def woot_request(method, url, accept_statuses=(200,), **kwargs):
         response = None
         try:
             _throttle()
+            # Counted before the call, not after: a request that times out may
+            # still have reached the API and spent quota. Over-counting is safe,
+            # under-counting is how the daily limit gets blown through again.
+            global _request_count
+            _request_count += 1
             response = requests.request(method, url, headers=headers, **kwargs)
         except requests.RequestException as e:
             logging.warning(f"Request to {url} failed: {e}")
@@ -893,20 +981,147 @@ def woot_request(method, url, accept_statuses=(200,), **kwargs):
     return None
 
 
+def _normalise_items(item_list):
+    """
+    Copy feed items with their ID field normalised.
+
+    The feed calls it OfferId and getoffers calls it Id; carrying both means the
+    rest of the pipeline never has to care which endpoint an item came from.
+    """
+    out = []
+    for item in item_list:
+        if not isinstance(item, dict):
+            continue
+        processed_item = item.copy()
+        if "OfferId" in item:
+            processed_item["Id"] = item["OfferId"]
+        elif "Id" in item:
+            processed_item["OfferId"] = item["Id"]
+        out.append(processed_item)
+    return out
+
+
+def _read_feed_payload(response, label):
+    """
+    Validate one feed response and return its items, or None if unusable.
+
+    Records schema problems rather than raising: a shape change must surface as a
+    health event, not as a traceback that looks like a transient outage.
+    """
+    try:
+        api_response = response.json()
+    except ValueError as e:
+        logging.error(f"Feed {label} was not valid JSON: {e}")
+        return None
+
+    if not isinstance(api_response, dict):
+        logging.error(f"Unexpected feed payload type: {type(api_response).__name__}")
+        return None
+
+    reported_pages = api_response.get("TotalPages")
+    if not isinstance(reported_pages, int) or reported_pages <= 0:
+        _feed_stats["schema_ok"] = False
+    else:
+        _feed_stats["reported_pages"] = max(
+            _feed_stats.get("reported_pages", 0), reported_pages)
+
+    if "Items" not in api_response:
+        _feed_stats["schema_ok"] = False
+
+    item_list = api_response.get("Items")
+    if not isinstance(item_list, list):
+        logging.error(
+            f"Feed {label} has no usable Items list "
+            f"(got {type(item_list).__name__})"
+        )
+        return None
+    return item_list
+
+
+def _fetch_feed_single():
+    """
+    Fetch the whole feed in ONE request by omitting the `page` parameter.
+
+    This is the cheap path and the reason the daily quota is no longer a
+    constraint: the same ~5000 items that cost 51 paginated requests cost 1 here.
+    Returns (items, ok); ok is False when the response was missing, malformed or
+    implausibly short, which sends the caller to the paginated fallback.
+    """
+    response = woot_request("GET", FEED_ENDPOINT)
+    if response is None:
+        logging.warning("Single-request feed fetch failed; will consider fallback")
+        return [], False
+
+    item_list = _read_feed_payload(response, "single-request response")
+    if item_list is None:
+        return [], False
+
+    items = _normalise_items(item_list)
+    # A short answer here means the endpoint quietly changed behaviour (for
+    # instance starting to paginate). Treat it as a miss and let the paginated
+    # path prove what the feed really holds, rather than trusting a partial read.
+    if len(items) < FEED_SIZE_FLOOR:
+        logging.warning(
+            f"Single-request fetch returned only {len(items)} items "
+            f"(below the {FEED_SIZE_FLOOR} floor); falling back to pagination"
+        )
+        return [], False
+
+    _feed_stats["single_request"] = True
+    _feed_stats["pages_fetched"] = 1
+    logging.info(f"Fetched {len(items)} feed items in a single request")
+    return items, True
+
+
 def fetch_feed():
     """
-    Fetch every page of the Woot feed.
+    Fetch the Woot feed, cheaply when possible.
 
-    Returns (items, complete). `complete` is False when the feed was cut short by
-    a rate limit, an API error, or the run budget, so the caller can avoid
-    recording offers it never actually looked at as "seen".
+    Tries the single-request form first (1 request), falling back to paginated
+    reads (51 requests) only when that fails AND the day's request budget can
+    still afford it. Without that budget check the fallback would be a way to
+    silently spend 51x the intended quota on every run -- the same failure this
+    whole change exists to remove.
+
+    Returns (items, complete). `complete` is False when the feed was cut short,
+    so the caller can avoid recording offers it never looked at as "seen".
     """
     logging.info("Fetching feed from Woot API")
 
     _feed_stats.clear()
     _feed_stats.update({"pages_fetched": 0, "reported_pages": 0,
-                        "rate_limit_hits": 0, "schema_ok": True})
+                        "rate_limit_hits": 0, "schema_ok": True,
+                        "single_request": False})
 
+    items, ok = _fetch_feed_single()
+    if ok:
+        return items, True
+
+    # The fallback is expensive. Only spend it if today can still spare it.
+    if quota_remaining() < PAGINATED_FETCH_COST:
+        logging.error(
+            f"Skipping paginated fallback: only {quota_remaining()} requests left "
+            f"under today's ceiling of {DAILY_REQUEST_CEILING}, "
+            f"need ~{PAGINATED_FETCH_COST}"
+        )
+        record_health_event(
+            "feed_fallback_skipped",
+            f"the single-request fetch failed and the day's remaining request "
+            f"budget ({quota_remaining()}) could not afford the paginated retry"
+        )
+        return [], False
+
+    logging.warning("Falling back to paginated feed fetch")
+    return _fetch_feed_paginated()
+
+
+def _fetch_feed_paginated():
+    """
+    Fetch the feed one page at a time -- the original, expensive path.
+
+    Kept as a fallback so a change in the single-request endpoint degrades to
+    something proven rather than to nothing.
+    """
     all_items = []
     current_page = 1
     total_pages = 1
@@ -945,47 +1160,24 @@ def fetch_feed():
                 complete = False
             break
 
-        try:
-            api_response = response.json()
-        except ValueError as e:
-            logging.error(f"Feed page {current_page} was not valid JSON: {e}")
+        # A malformed page is an API shape change, not the end of the feed, so it
+        # must never masquerade as a complete read.
+        item_list = _read_feed_payload(response, f"page {current_page}")
+        if item_list is None:
             complete = False
             break
 
-        if not isinstance(api_response, dict):
-            logging.error(f"Unexpected feed payload type: {type(api_response).__name__}")
-            complete = False
-            break
-
-        reported_pages = api_response.get("TotalPages")
-        if not isinstance(reported_pages, int) or reported_pages <= 0:
-            # Without a usable TotalPages the loop would read page 1, find
-            # total_pages still at its initial 1, and exit reporting a complete
-            # feed of 100 items. Treat a broken contract as a broken contract.
-            _feed_stats["schema_ok"] = False
-        if isinstance(reported_pages, int) and reported_pages > 0:
-            _feed_stats["reported_pages"] = max(_feed_stats["reported_pages"],
-                                                reported_pages)
+        # Without a usable TotalPages the loop would read page 1, find total_pages
+        # still at its initial 1, and exit reporting a complete feed of 100 items.
+        # _read_feed_payload already flagged that as a schema problem.
+        reported_pages = _feed_stats.get("reported_pages", 0)
+        if reported_pages:
             if reported_pages > MAX_FEED_PAGES:
                 logging.warning(
                     f"Feed reports {reported_pages} pages, capping at {MAX_FEED_PAGES}"
                 )
                 complete = False
             total_pages = min(reported_pages, MAX_FEED_PAGES)
-
-        if "Items" not in api_response:
-            _feed_stats["schema_ok"] = False
-
-        item_list = api_response.get("Items")
-        if not isinstance(item_list, list):
-            # A missing or malformed Items list is an API shape change, not the
-            # end of the feed. Do not let it masquerade as a complete read.
-            logging.error(
-                f"Feed page {current_page} has no usable Items list "
-                f"(got {type(item_list).__name__})"
-            )
-            complete = False
-            break
 
         if not item_list:
             # An empty page at the advertised end is a normal finish; an empty
@@ -999,16 +1191,7 @@ def fetch_feed():
                 complete = False
             break
 
-        for item in item_list:
-            if not isinstance(item, dict):
-                continue
-            # Normalise the ID field: the feed uses OfferId, getoffers uses Id.
-            processed_item = item.copy()
-            if "OfferId" in item:
-                processed_item["Id"] = item["OfferId"]
-            elif "Id" in item:
-                processed_item["OfferId"] = item["Id"]
-            all_items.append(processed_item)
+        all_items.extend(_normalise_items(item_list))
 
         logging.info(
             f"Feed page {current_page}/{total_pages}: {len(item_list)} items "
@@ -1604,9 +1787,14 @@ def check_feed_health(feed_items, feed_ids, items, feed_complete):
     # Did we actually read the whole feed? Page count is a far finer measure of
     # truncation than item count. The -1 allows for the known off-by-one where
     # the API advertises one more page than it serves.
+    # Page count is meaningless for a single-request fetch: one response carries
+    # the whole feed while TotalPages still advertises 51. Comparing them there
+    # would flag every healthy run. The item-count checks below still apply, and
+    # they are what actually detect a short read on this path.
     pages = _feed_stats.get("pages_fetched", 0)
     reported = _feed_stats.get("reported_pages", 0)
-    if feed_complete and reported and pages < reported - 1:
+    if (not _feed_stats.get("single_request")
+            and feed_complete and reported and pages < reported - 1):
         record_health_event(
             "feed_pages_too_few",
             f"read {pages} of {reported} pages but the feed reported itself complete"
