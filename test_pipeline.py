@@ -225,6 +225,13 @@ class PipelineTestBase(unittest.TestCase):
         main._last_request_time = 0.0
         main._run_deadline = None
 
+        # All really is pinned at Woot's 5000-item ceiling in production, and the
+        # fixture mirrors that. Seed it as already-known so ordinary runs are
+        # quiet -- alerting on a permanently capped feed every run would make the
+        # signal worthless. The newly-capped tests exercise the change detection.
+        self.store[main.HEALTH_STATE_FILENAME] = json.dumps(
+            {"capped_feeds": ["All"]})
+
         patches = [
             mock.patch.object(main.requests, "request", self.api.request),
             mock.patch.object(main.time, "monotonic", self.api.monotonic),
@@ -577,6 +584,53 @@ class MultiFeedTest(PipelineTestBase):
             self.run_check()
         self.assertIn("feed_coverage_partial",
                       [e["kind"] for e in main._health_events])
+
+    def _cap_feed(self, feed_name, count=5000):
+        """Make one feed answer at Woot's 5000-item ceiling."""
+        real = self.api.request
+
+        def request(method, url, **kwargs):
+            if f"/feed/{feed_name}" in url and "page=" not in url:
+                return FakeResponse(200, {
+                    "Items": [make_item(900000 + i) for i in range(count)],
+                    "MarketingName": feed_name, "TotalPages": 51,
+                })
+            return real(method, url, **kwargs)
+
+        return request
+
+    def test_capped_feeds_are_reported_every_run(self):
+        # Visibility even when nothing is wrong: a capped feed is otherwise
+        # invisible, since the run still says 11/11 read and complete.
+        with mock.patch.object(main.requests, "request", self._cap_feed("Home")):
+            main.start_run_budget()
+            main.fetch_feed()
+        self.assertIn("Home", main.capped_feeds())
+
+    def test_a_feed_newly_reaching_the_cap_is_flagged(self):
+        with mock.patch.object(main.requests, "request",
+                               self._cap_feed("Electronics")):
+            self.run_check()
+        self.assertIn("feed_newly_capped",
+                      [e["kind"] for e in main._health_events])
+
+    def test_an_already_capped_feed_does_not_re_alert(self):
+        # Home, Clearance and All are permanently capped in production. If those
+        # alerted every run the signal would be worthless within a day.
+        self.store[main.HEALTH_STATE_FILENAME] = json.dumps(
+            {"capped_feeds": ["All", "Home"]})
+        with mock.patch.object(main.requests, "request", self._cap_feed("Home")):
+            self.run_check()
+        self.assertNotIn("feed_newly_capped",
+                         [e["kind"] for e in main._health_events])
+
+    def test_a_feed_below_the_warn_ratio_is_not_capped(self):
+        # Electronics sits near 20% of the ceiling; it must stay quiet.
+        with mock.patch.object(main.requests, "request",
+                               self._cap_feed("Electronics", count=900)):
+            main.start_run_budget()
+            main.fetch_feed()
+        self.assertNotIn("Electronics", main.capped_feeds())
 
     def test_regressing_to_all_only_coverage_trips_the_size_floor(self):
         # The most likely silent failure: categories stop working and only All

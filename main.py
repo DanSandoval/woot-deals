@@ -126,6 +126,16 @@ HEALTH_MARKER = "WOOT_HEALTH"
 # likely way this breaks -- trips the floor instead of looking healthy.
 FEED_SIZE_FLOOR = 6000
 
+# Woot caps every feed at 5000 items: staff-confirmed, and page 51 answers 404,
+# so pagination cannot reach past it either. A feed sitting at the ceiling is
+# hiding an unknown amount of inventory, and nothing in a run says so -- it still
+# reports 11/11 feeds read and complete=true. Home, Clearance and All are already
+# there. What matters is the ones that are NOT: Electronics and Computers sit near
+# 20% and are where this tracker's keywords actually live, so those crossing the
+# ceiling is the only case that can silently cost a real deal.
+WOOT_FEED_ITEM_CAP = 5000
+FEED_CAP_WARN_RATIO = 0.90  # warn approaching the ceiling, not only at it
+
 # A drop against the recent norm catches a shrink that never crosses the floor.
 # The baseline is the median of recent healthy runs, not the largest ever seen: a
 # high-water mark only ratchets up, so one anomalous run raises the bar forever,
@@ -816,6 +826,10 @@ def _report_run_health(status, metrics):
     except (TypeError, ValueError):
         prior = 0
     state["quota"] = {"date": today, "used": prior + _request_count}
+    # Remember which feeds are capped so the next run alerts only on a change.
+    current_caps = capped_feeds()
+    if current_caps or state.get("capped_feeds"):
+        state["capped_feeds"] = current_caps
 
     # Both go in the summary line. The daily quota is the limit that actually
     # took this service down, so it belongs in routine output where a trend is
@@ -1095,6 +1109,7 @@ def _fetch_one_feed_single(feed_name):
         )
         return [], False
 
+    _feed_stats.setdefault("feed_sizes", {})[feed_name] = len(items)
     logging.info(
         f"Feed '{feed_name}': {len(items)} items in one request "
         f"(reports {reported_pages} pages)"
@@ -1130,6 +1145,18 @@ def _fetch_feed_with_fallback(feed_name):
 
     logging.warning(f"Falling back to paginated fetch for feed '{feed_name}'")
     return _fetch_feed_paginated(feed_name)
+
+
+def capped_feeds():
+    """
+    Feeds at or near Woot's 5000-item ceiling, and so hiding inventory.
+
+    Reported every run for visibility; only a CHANGE in this set is worth
+    alerting on, since the already-capped feeds would otherwise alert forever.
+    """
+    threshold = WOOT_FEED_ITEM_CAP * FEED_CAP_WARN_RATIO
+    return sorted(name for name, count in (_feed_stats.get("feed_sizes") or {}).items()
+                  if count >= threshold)
 
 
 def fetch_feed():
@@ -1741,6 +1768,7 @@ def _run_deal_check():
     check_feed_health(len(feed_items), feed_ids, feed_items, feed_complete)
 
     metrics["feeds"] = f"{_feed_stats.get('feeds_ok', 0)}/{len(FEED_NAMES)}"
+    metrics["capped"] = ",".join(capped_feeds()) or "none"
     metrics["raw_items"] = _feed_stats.get("raw_items", 0)
     metrics["pages"] = _feed_stats.get("pages_fetched", 0)
     metrics["rate_limit_hits"] = _feed_stats.get("rate_limit_hits", 0)
@@ -1928,6 +1956,23 @@ def check_feed_health(feed_items, feed_ids, items, feed_complete):
             f"the largest feed now reports {reported} pages; the run budget "
             f"supports about "
             f"{int((RUN_BUDGET_SECONDS - FEED_BUDGET_RESERVE) / MIN_REQUEST_INTERVAL)}"
+        )
+
+    # A capped feed is silent by nature: the run still reports every feed read and
+    # complete. Alert only when a feed NEWLY reaches the ceiling -- the ones
+    # already there would otherwise fire on every run forever.
+    try:
+        _state_for_checks = load_health_state()
+    except Exception:
+        _state_for_checks = {}
+    newly_capped = [f for f in capped_feeds()
+                    if f not in set(_state_for_checks.get("capped_feeds") or [])]
+    if newly_capped:
+        record_health_event(
+            "feed_newly_capped",
+            f"{', '.join(newly_capped)} reached Woot's {WOOT_FEED_ITEM_CAP}-item "
+            f"ceiling; offers past it cannot be fetched by any request, so this "
+            f"feed's coverage is now partial and will stay that way"
         )
 
     try:

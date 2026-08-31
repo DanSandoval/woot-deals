@@ -191,7 +191,7 @@ not been set up.
 
 Layer 1 cannot report a failure the service is not awake to notice, and it
 cannot email about a broken email path. Two alert policies in the
-`woot-deals-tracker` project cover that, both notifying `casadtd@gmail.com`:
+`woot-deals-tracker` project cover that, both notifying the project owner:
 
 - **Woot tracker reported a problem** - fires on the log-based metric
   `woot_health_problem`, which counts `WOOT_HEALTH status=degraded|failed` lines.
