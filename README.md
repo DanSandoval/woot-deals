@@ -5,7 +5,9 @@ A Google Cloud Run service that monitors Woot.com for deals matching your keywor
 ## Overview
 
 This service:
-- Periodically checks the Woot API for new deals
+- Polls all 11 Woot feeds every 30 minutes and merges them into one
+  deduplicated catalogue (~13,600 offers), because the `All` feed alone is
+  capped at 5000 items and shows only ~40% of what is for sale
 - Filters deals based on configurable keywords
 - Sends email notifications for matching deals
 - Tracks previously seen deals to avoid duplicates
@@ -57,7 +59,7 @@ This service:
 
 5. Set up Cloud Scheduler:
    ```
-   gcloud scheduler jobs create http woot-deals-hourly \
+   gcloud scheduler jobs create http woot-deals-tracker \
      --schedule="0 * * * *" \
      --uri="https://YOUR-CLOUD-RUN-URL" \
      --http-method=GET \
@@ -124,12 +126,13 @@ Conditions that mark a run `degraded` or `failed`:
 | `feed_incomplete` | the feed was cut short - the original bug |
 | `feed_too_small` | fewer than `FEED_SIZE_FLOOR` items came back |
 | `feed_shrank` | feed is under `FEED_SHRINK_RATIO` of its recent median |
-| `feed_pages_too_few` | fewer pages read than the feed advertised, yet it reported itself complete |
+| `feed_coverage_partial` | fewer than all 11 feeds were read, so the catalogue seen is incomplete |
 | `feed_schema_invalid` | `TotalPages` or `Items` missing or changed type |
-| `feed_duplicate_ids` | the same offers repeating - pagination may be ignored |
+| `feed_newly_capped` | a feed newly hit Woot's 5000-item ceiling; offers past it are unreachable |
+| `feed_fallback_skipped` | a feed needed the expensive paginated retry and the day's request budget could not afford it |
 | `feed_text_missing` | feed items lost their titles, so the matcher sees nothing |
 | `feed_not_changing` | no new offers for `NO_NEW_ITEMS_RUNS` runs; feed stale or seen-index wrong |
-| `feed_outgrowing_budget` | the feed has more pages than the run budget can read |
+| `feed_outgrowing_budget` | a feed reports more pages than the paginated fallback could read |
 | `feed_empty` | the feed returned nothing |
 | `detail_fetch_incomplete` | candidate offers could not be keyword-checked |
 | `notification_failed` | matching deals could not be sent |
@@ -202,7 +205,9 @@ cannot email about a broken email path. Two alert policies in the
 Every run emits exactly one machine-readable line that these key off:
 
 ```
-WOOT_HEALTH status=ok problems=none feed_complete=true feed_items=5000 matches=0 ...
+WOOT_HEALTH status=ok problems=none capped=All,Clearance,Home,Sports duration_s=26.3
+feed_complete=true feed_items=13618 feeds=11/11 matches=0 quota_used=352/1000
+raw_items=23902 requests=11 seen_deals=63740 ...
 ```
 
 To see recent health lines:
@@ -219,6 +224,46 @@ gcloud logging metrics list --project=woot-deals-tracker
 gcloud beta monitoring channels list --project=woot-deals-tracker
 ```
 
+## Feed coverage and the 5000-item cap
+
+Woot caps **every** feed at 5000 items. This is not a response-size limit: for a
+capped feed `TotalPages` reports 51, pages 1-50 each serve 100 items, and page 51
+returns 404, so pagination cannot reach past it either. Verified 2026-08-31.
+
+Measured that day, `All`, `Clearance`, `Home` and `Sports` were all at or near the
+ceiling while `Electronics` (~19%) and `Computers` (~17%) had plenty of room.
+Since this tracker's keywords are e-reader and AirTag terms, and those live in the
+uncapped feeds, the hidden inventory is mostly home goods. **That is the only
+reason the cap is tolerable** - if `Electronics` or `Computers` ever approach 5000,
+real deals start being hidden, which is what `feed_newly_capped` exists to catch.
+
+There is no way around it inside the API. Verified dead ends:
+
+- paginating past page 50 -> 404
+- undocumented feed names (`Sellout`, `Daily`, `Grocery`, sub-categories) -> 400
+- no `sort`, `since`, `modifiedAfter` or filter parameter exists
+
+Merging the 11 documented feeds is the whole of what is reachable. Raising the cap
+would need Woot to agree; the venue is their API discussion forum thread.
+
+## Deploying
+
+**Pushing to `master` deploys to production.** A Cloud Build trigger
+(`^master$`) builds the Dockerfile and runs `gcloud run deploy`. It passes only
+`--image`, `--labels` and `--region`, so Cloud Run inherits the existing service
+config - the `maxScale=1` / `containerConcurrency=1` settings and all env vars
+survive a trigger deploy (verified on revision 00037).
+
+Those two settings matter: all per-run state in `main.py` is module-level globals
+with no lock, so two overlapping runs would corrupt each other's health reporting
+and double the request rate against the shared API key. Keep them at 1.
+
+To deploy by hand without going through `master`:
+
+```
+gcloud run deploy woot-deals --source . --region=us-central1 --project=woot-deals-tracker
+```
+
 ## Troubleshooting
 
 If the service isn't working as expected:
@@ -230,9 +275,22 @@ If the service isn't working as expected:
 
 ### Rate limiting
 
-The Woot API rate limits like a token bucket: a small burst, then roughly one
-request per second. The feed is ~51 pages, so every API call goes through a
-shared pacer (`MIN_REQUEST_INTERVAL`) and retries 429s with exponential backoff.
+The Woot API enforces **two separate limits**, and telling them apart matters:
+
+| 429 response | Meaning | Does backoff help? |
+|---|---|---|
+| `ThrottlingException` / "Too Many Requests" | the 1/sec rate throttle | yes |
+| `LimitExceededException` / "Limit Exceeded" | the **1000 requests/day quota** | no - only 00:00 UTC does |
+
+Every call goes through a shared pacer (`MIN_REQUEST_INTERVAL`) and retries the
+first kind with exponential backoff. The second kind took the service down for an
+evening: paginating one feed cost 51 requests, so hourly polling needed 1224/day
+against the 1000/day quota and the feed died every evening around 19:00 UTC.
+
+Omitting the `page` parameter returns a whole feed in ONE request, so a run now
+costs 11 requests (one per feed) rather than 51 per feed. Daily spend is tracked
+across runs in `health_state.json`, keyed by UTC date because that is when the
+quota resets, and reported as `quota_used=` on every run.
 
 If the logs show `complete=False` in the run summary, the feed was cut short and
 the offers on the pages that were never reached are deliberately left unrecorded
