@@ -313,6 +313,33 @@ class PipelineTest(PipelineTestBase):
             with self.subTest(title=title):
                 self.assertFalse(main.matched_keywords(title), title)
 
+    def test_mac_mini_spellings_all_match(self):
+        for title in ["Apple Mac mini M2 8GB 256GB",
+                      "Apple Mac Mini (2023)",
+                      "Apple Mac-Mini Desktop",
+                      "apple-mac-mini-m4-16gb-512gb"]:
+            with self.subTest(title=title):
+                self.assertEqual(main.matched_keywords(title), ["mac mini"])
+
+    def test_3d_printer_spellings_all_match(self):
+        for title in ["Creality Ender 3 V3 SE 3D Printer",
+                      "Bambu Lab A1 Mini 3D-Printer",
+                      "Resin 3D Printers, 2-Pack",
+                      "anycubic-kobra-2-neo-3d-printer"]:
+            with self.subTest(title=title):
+                self.assertEqual(main.matched_keywords(title), ["3d printer"])
+        self.assertEqual(main.matched_keywords("FlashForge 3-D Printer"),
+                         ["3-d printer"])
+
+    def test_mac_mini_and_3d_printer_keywords_do_not_match_unrelated_offers(self):
+        for title in ["Apple MacBook Air 13-inch",
+                      "Apple iMac 24-inch M3",
+                      "HP LaserJet Pro Printer",
+                      "Sony 3D Blu-ray Player",
+                      "Compact Mini Fridge"]:
+            with self.subTest(title=title):
+                self.assertFalse(main.matched_keywords(title), title)
+
     def test_prefilter_tolerates_null_fields(self):
         item = make_item(4200)
         self.assertIsNone(item["Subtitle"])

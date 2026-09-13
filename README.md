@@ -232,8 +232,10 @@ returns 404, so pagination cannot reach past it either. Verified 2026-08-31.
 
 Measured that day, `All`, `Clearance`, `Home` and `Sports` were all at or near the
 ceiling while `Electronics` (~19%) and `Computers` (~17%) had plenty of room.
-Since this tracker's keywords are e-reader and AirTag terms, and those live in the
-uncapped feeds, the hidden inventory is mostly home goods. **That is the only
+Since this tracker's e-reader, AirTag and Mac mini keywords live in the uncapped
+feeds, the hidden inventory is mostly home goods. (Which feed 3D printers land in
+has not been measured; if it is `Home` or `Tools` near the ceiling, some can be
+hidden.) **That is the only
 reason the cap is tolerable** - if `Electronics` or `Computers` ever approach 5000,
 real deals start being hidden, which is what `feed_newly_capped` exists to catch.
 

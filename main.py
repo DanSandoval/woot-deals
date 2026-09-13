@@ -39,11 +39,16 @@ FEED_PAGE_SIZE = 100
 
 GETOFFERS_ENDPOINT = "https://developer.woot.com/getoffers"
 KEYWORDS = ["kindle", "ereader", "e-reader", "e-ink", "kobo", "nook", "eink",
-            "airtag", "air-tag"]
+            "airtag", "air-tag", "mac mini", "3d printer", "3-d printer"]
 # Both AirTag spellings are listed for the same reason as ereader/e-reader:
 # normalize_text flattens hyphens, so "air-tag" covers "Air Tag" and
 # "Air-Tag" while "airtag" covers Apple's own one-word branding. Matching is
 # substring, so "airtag" also picks up the "AirTags" plural on its own.
+# "mac mini" needs one entry: flattening already turns "Mac-Mini" and the
+# "apple-mac-mini-m4" slug into the same text. "3d printer" covers "3D Printer",
+# "3D-Printer" and the plural, but "3-D Printer" flattens to "3 d printer", so
+# that spelling is listed separately. Accessories named after the product
+# ("Stand for Mac mini", "3D Printer Filament") match too, as AirTag cases do.
 
 
 def normalize_text(text):
