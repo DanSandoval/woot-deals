@@ -11,6 +11,7 @@ Run: python test_pipeline.py
 import json
 import os
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 os.environ.setdefault("WOOT_API_KEY", "test-key")
@@ -256,6 +257,21 @@ class PipelineTestBase(unittest.TestCase):
         """Run one pass; returns (body, http_status)."""
         main._last_request_time = 0.0
         return main.check_woot_deals(None)
+
+    def health_line(self):
+        """
+        Run one pass and return its machine-readable summary line.
+
+        Cloud Monitoring keys off this exact string, so tests about which tier an
+        event lands in have to read it rather than the alert: a notable event is
+        deliberately invisible to self.alerts.
+        """
+        with self.assertLogs(level="INFO") as captured:
+            self.run_check()
+        lines = [r.getMessage() for r in captured.records
+                 if r.getMessage().startswith(main.HEALTH_MARKER + " ")]
+        self.assertTrue(lines, "the run emitted no health summary line")
+        return lines[-1]
 
     def health_state(self):
         return json.loads(self.store.get(main.HEALTH_STATE_FILENAME, "{}"))
@@ -659,6 +675,57 @@ class MultiFeedTest(PipelineTestBase):
             main.fetch_feed()
         self.assertNotIn("Electronics", main.capped_feeds())
 
+    # -- the deadband --------------------------------------------------------
+    # Home sat within a few dozen items of the 4500 entry line for ten days and
+    # re-reported itself as newly capped four times as it drifted across. These
+    # pin the gap that stops that without hiding a real crossing.
+
+    def _drifting(self):
+        """A feed between the clear line (4250) and the entry line (4500)."""
+        return self._cap_feed("Home", count=4300)
+
+    def test_a_feed_drifting_below_entry_stays_capped_and_stays_quiet(self):
+        self.store[main.HEALTH_STATE_FILENAME] = json.dumps(
+            {"capped_feeds": ["All", "Home"]})
+        with mock.patch.object(main.requests, "request", self._drifting()):
+            self.run_check()
+        # Still counted as capped, because it has not cleared the lower line...
+        self.assertIn("Home", self.health_state()["capped_feeds"])
+        # ...and therefore never re-announces itself.
+        self.assertNotIn("feed_newly_capped",
+                         [e["kind"] for e in main._health_events])
+
+    def test_the_same_size_does_not_newly_cap_a_feed_that_was_clear(self):
+        # The gap must be directional: 4300 holds a feed in, but cannot pull an
+        # uncapped one across. Otherwise the deadband would just move the line.
+        self.store[main.HEALTH_STATE_FILENAME] = json.dumps(
+            {"capped_feeds": ["All"]})
+        with mock.patch.object(main.requests, "request", self._drifting()):
+            self.run_check()
+        self.assertNotIn("Home", self.health_state()["capped_feeds"])
+        self.assertNotIn("feed_newly_capped",
+                         [e["kind"] for e in main._health_events])
+
+    def test_clearing_the_lower_line_releases_the_feed(self):
+        # The deadband must not be a one-way latch: a feed that genuinely empties
+        # has to leave the set, or it can never be reported as capped again.
+        self.store[main.HEALTH_STATE_FILENAME] = json.dumps(
+            {"capped_feeds": ["All", "Home"]})
+        with mock.patch.object(main.requests, "request",
+                               self._cap_feed("Home", count=4000)):
+            self.run_check()
+        self.assertNotIn("Home", self.health_state()["capped_feeds"])
+
+    def test_a_genuine_crossing_still_reports(self):
+        # The point of the gap is to keep this signal meaningful, not to mute it.
+        self.store[main.HEALTH_STATE_FILENAME] = json.dumps(
+            {"capped_feeds": ["All"]})
+        with mock.patch.object(main.requests, "request",
+                               self._cap_feed("Home", count=4900)):
+            self.run_check()
+        self.assertIn("feed_newly_capped",
+                      [e["kind"] for e in main._health_events])
+
     def test_regressing_to_all_only_coverage_trips_the_size_floor(self):
         # The most likely silent failure: categories stop working and only All
         # answers. 5000 items looks plausible, so the floor sits above it.
@@ -853,12 +920,16 @@ class HealthAlertingTest(PipelineTestBase):
         # 70 complete pages = 7000 items: above the 6000 floor but below 70% of
         # the 12000 median, so this isolates the ratio check from the floor.
         with mock.patch.object(main.requests, "request", self._serve_pages(70)):
-            body, _ = self.run_check()
+            line = self.health_line()
 
-        self.assertIn("health: degraded", body)
-        kinds = " ".join(a[0] for a in self.alerts)
-        self.assertIn("feed_shrank", kinds)
-        self.assertNotIn("feed_too_small", kinds)
+        # feed_shrank is a notable event, so it reports in notes= rather than
+        # problems=. It is a relative dip; feed_coverage_partial is the check
+        # that pages when the shrink has a structural cause.
+        self.assertIn("feed_shrank", line)
+        self.assertIn("notes=", line)
+        notes = line.split("notes=")[1].split(" ")[0]
+        self.assertIn("feed_shrank", notes)
+        self.assertNotIn("feed_too_small", line.split("problems=")[1].split(" ")[0])
 
     def test_a_truncated_run_never_moves_the_baseline(self):
         """A baseline fed by bad runs drifts down to meet the failure and disarms itself."""
@@ -1064,6 +1135,141 @@ class NotificationTest(unittest.TestCase):
         sms = server.send_message.call_args_list[0][0][0].get_payload()[0].get_payload()
         self.assertIn("kindle", sms)
         self.assertLessEqual(len(sms), 140)
+
+
+class HealthTieringTest(PipelineTestBase):
+    """
+    Two tiers: paging events escalate the run and reach the user, notable ones
+    only annotate it.
+
+    Before this split every one of twenty-odd checks escalated the run, so a
+    harmless one (the seen index passing an ageing size ceiling) reported a
+    problem every thirty minutes for a day. The danger of noise is not the
+    annoyance: a real failure arriving in the middle of it is invisible.
+    """
+
+    def _report(self, kinds, status="ok"):
+        """Record the given event kinds and emit one health summary line."""
+        main.reset_health_events()
+        for kind in kinds:
+            main.record_health_event(kind, "synthetic")
+        with self.assertLogs(level="INFO") as captured:
+            reported = main.report_run_health(status, {"feed_items": 12000,
+                                                       "feed_complete": "true"})
+        lines = [r.getMessage() for r in captured.records
+                 if r.getMessage().startswith(main.HEALTH_MARKER + " ")]
+        return reported, lines[-1]
+
+    def test_a_notable_event_keeps_the_run_ok(self):
+        # The regression this guards against is worse than the noise it removed.
+        # The absence policy fires when no "status=ok" line appears for three
+        # hours, so if a notable event suppressed that string, demoting an event
+        # that fires every run would trade a harmless alert for "the tracker has
+        # not completed a healthy run" -- which means the service is dead.
+        status, line = self._report(["feed_newly_capped"])
+        self.assertEqual(status, "ok")
+        self.assertIn("status=ok", line)
+        self.assertEqual(self.alerts, [], "a notable event must not alert")
+
+    def test_a_notable_event_is_still_visible_in_the_line(self):
+        # Demoted, not hidden: it has to stay greppable for whoever is looking.
+        _, line = self._report(["feed_newly_capped", "run_near_deadline"])
+        notes = line.split("notes=")[1].split(" ")[0]
+        self.assertEqual(sorted(notes.split(",")),
+                         ["feed_newly_capped", "run_near_deadline"])
+        self.assertIn("problems=none", line)
+
+    def test_a_paging_event_still_escalates_and_alerts(self):
+        status, line = self._report(["feed_empty"])
+        self.assertEqual(status, "degraded")
+        self.assertIn("problems=feed_empty", line)
+        self.assertTrue(self.alerts, "a paging event must reach the user")
+
+    def test_a_mixed_run_separates_the_two(self):
+        _, line = self._report(["feed_empty", "feed_newly_capped"])
+        self.assertIn("problems=feed_empty", line)
+        self.assertIn("notes=feed_newly_capped", line)
+        subject = self.alerts[0][0]
+        self.assertIn("feed_empty", subject)
+        self.assertNotIn("feed_newly_capped", subject)
+
+    def test_an_unclassified_event_pages(self):
+        # The default has to be loud. Forgetting to classify a new check should
+        # over-alert, never silently disable it.
+        status, _ = self._report(["some_check_added_next_year"])
+        self.assertEqual(status, "degraded")
+
+    def test_the_two_silent_failure_guards_are_never_notable(self):
+        # Both describe the pipeline looking healthy while observing or matching
+        # nothing -- the exact failure this service was written after -- and
+        # canary_hits is only observed, never checked, so these are the only
+        # guards against it. Demoting either is the mistake this test blocks.
+        for kind in ("feed_not_changing", "feed_text_missing"):
+            with self.subTest(kind=kind):
+                self.assertNotIn(kind, main.NOTABLE_EVENTS)
+                self.assertTrue(main.event_pages(kind))
+
+    def test_a_notable_event_does_not_move_the_feed_baseline(self):
+        # Notable events no longer escalate the status, so the baseline guard
+        # can no longer key off status alone: a partial run must still not be
+        # allowed to set the bar it will later be judged against.
+        _, _ = self._report(["feed_shrank"])
+        self.assertEqual(self.health_state().get("recent_feed_sizes", []), [])
+
+
+class SeenStateChecksTest(PipelineTestBase):
+    """The seen index: what is worth waking someone for, and what is not."""
+
+    def test_a_truncated_index_still_pages(self):
+        # The dangerous direction. An index that lost its contents re-notifies
+        # every live deal on Woot, so this one keeps its alert.
+        self.assertTrue(main.event_pages("seen_state_implausible"))
+
+    def test_an_oversized_index_only_notes(self):
+        # The harmless direction, and the one that actually fired for a day.
+        self.assertIn("seen_state_oversized", main.NOTABLE_EVENTS)
+
+    def test_the_ceiling_sits_above_a_plausible_steady_state(self):
+        # The old 90000 was set when this service read one 5000-item feed; the
+        # move to eleven tripled the growth rate and breached it. The index was
+        # ~90800 on 2026-09-20 and peaks before a retention cohort expires, so
+        # the backstop has to clear that by a wide margin to mean anything.
+        self.assertGreater(main.SEEN_STATE_MAX, 200000)
+
+    def _stale_index(self, count=600):
+        old = (datetime.now(timezone.utc)
+               - timedelta(days=main.SEEN_DEALS_RETENTION_DAYS + 5)).isoformat()
+        return json.dumps(
+            {"version": 1, "deals": {f"stale-{i}": old for i in range(count)}})
+
+    def test_stale_entries_alone_report_nothing_because_pruning_works(self):
+        # The check must not fire on merely having old entries: the prune runs
+        # immediately before it and clears them. Otherwise it would be the same
+        # kind of false alarm it replaced.
+        self.store[main.SEEN_DEALS_FILENAME] = self._stale_index()
+        main.reset_health_events()
+        self.run_check()
+        self.assertNotIn("seen_state_unpruned",
+                         [e["kind"] for e in main._health_events])
+
+    def test_a_broken_prune_is_reported(self):
+        # The real failure: retention stops dropping anything and the file grows
+        # without bound. Stating the invariant means this is caught directly
+        # rather than inferred from a size that drifts with the catalogue.
+        self.store[main.SEEN_DEALS_FILENAME] = self._stale_index()
+        main.reset_health_events()
+        with mock.patch.object(main, "prune_seen_deals", lambda deals: deals):
+            self.run_check()
+        self.assertIn("seen_state_unpruned",
+                      [e["kind"] for e in main._health_events])
+
+    def test_a_healthy_index_reports_neither(self):
+        main.reset_health_events()
+        self.run_check()
+        kinds = [e["kind"] for e in main._health_events]
+        for kind in ("seen_state_unpruned", "seen_state_oversized",
+                     "seen_state_implausible"):
+            self.assertNotIn(kind, kinds)
 
 
 if __name__ == "__main__":

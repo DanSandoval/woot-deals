@@ -123,12 +123,50 @@ HEALTH_STATE_FILENAME = "health_state.json"
 # which is the only way to catch the service not running at all.
 HEALTH_MARKER = "WOOT_HEALTH"
 
-# Merging all the category feeds yields ~12400 distinct offers. The floor has to
-# sit ABOVE the failure it exists to catch: the original truncation returned
-# ~1300 items, so a floor of 1000 would have sat silently through the very bug it
-# was added for. 6000 is deliberately chosen to sit just above the 5000 that the
+# Not everything worth recording is worth interrupting someone for. Every check
+# below used to escalate the run to "degraded", which is what the paging metric
+# counts, so twenty-odd conditions ranging from "the service is down" to "a Woot
+# category got big" all rang the same bell. One of the harmless ones then fired
+# every thirty minutes for a day, which is how a noisy channel actually fails:
+# a real problem arriving in the middle of that is invisible.
+#
+# Events named here are recorded, logged and reported in the summary line's
+# notes= field, but do not change the run's status and do not alert. Everything
+# NOT named here pages -- an unclassified new event is meant to be loud, since
+# forgetting to classify one should never silently disable it.
+#
+# The test for this list is "what would I do about it at 3am?". Nothing here has
+# an answer; each is context for a human already looking. In particular
+# feed_not_changing and feed_text_missing are deliberately ABSENT: both describe
+# the pipeline looking healthy while observing or matching nothing, which is the
+# exact failure this service was built after, and canary_hits is only observed,
+# never checked, so those two are the only guards against it.
+NOTABLE_EVENTS = frozenset({
+    "feed_newly_capped",       # Woot's inventory crossed a line; nothing to do
+    "feed_fallback_skipped",   # the paginated fallback was not needed or afforded
+    "feed_shrank",             # relative dip; feed_coverage_partial pages instead
+    "feed_outgrowing_budget",  # early warning, not a failure
+    "run_near_deadline",       # ditto; an actual timeout fails the run loudly
+    "detail_fetch_incomplete", # some detail lookups missed; matching still ran
+    "deal_format_failed",      # one offer rendered badly
+    "seen_state_oversized",    # growth backstop, not a malfunction
+    "seen_state_unpruned",     # retention is not dropping anything; real but slow
+})
+
+# The floor has to sit ABOVE the failure it exists to catch: the original
+# truncation returned ~1300 items, so a floor of 1000 would have sat silently
+# through the very bug it was added for. 6000 sits just above the 5000 that the
 # All feed alone returns, so silently regressing to All-only coverage -- the most
-# likely way this breaks -- trips the floor instead of looking healthy.
+# likely way this breaks -- trips it instead of looking healthy.
+#
+# This is an absolute number describing a catalogue that changes size, so it is
+# worth knowing what backs it up. feed_coverage_partial now asks the structural
+# question directly (did we read all eleven feeds?) and pages on its own, so the
+# floor is a second line rather than the only one. The merged catalogue ran
+# ~13300 in early September and fell to ~9100 by the 20th, where it levelled off;
+# at that size the floor still has ~34% of room. If Woot's inventory ever does
+# fall through it, the honest fix is to delete this check rather than pick a new
+# number -- feed_coverage_partial and FEED_SHRINK_RATIO already cover it.
 FEED_SIZE_FLOOR = 6000
 
 # Woot caps every feed at 5000 items: staff-confirmed, and page 51 answers 404,
@@ -139,7 +177,12 @@ FEED_SIZE_FLOOR = 6000
 # 20% and are where this tracker's keywords actually live, so those crossing the
 # ceiling is the only case that can silently cost a real deal.
 WOOT_FEED_ITEM_CAP = 5000
-FEED_CAP_WARN_RATIO = 0.90  # warn approaching the ceiling, not only at it
+FEED_CAP_WARN_RATIO = 0.90  # enter the capped set approaching the ceiling
+# Leaving the set needs a LOWER threshold than entering it. Without that gap a
+# feed sitting at the warn line crosses it back and forth on ordinary churn and
+# re-reports itself as newly capped every time: Home did exactly that four times
+# in ten days. Entry at 4500, exit only below 4250.
+FEED_CAP_CLEAR_RATIO = 0.85
 
 # A drop against the recent norm catches a shrink that never crosses the floor.
 # The baseline is the median of recent healthy runs, not the largest ever seen: a
@@ -154,9 +197,18 @@ FEED_BASELINE_MIN_SAMPLES = 6  # below this the ratio check is not evaluated
 # works and the content is wrong -- the class the original bug belonged to.
 FEED_MIN_TITLE_RATIO = 0.95     # feed items carrying usable title text
 
-# The seen-index should sit near the live catalogue size plus recent churn.
+# The seen-index holds the live catalogue plus everything still inside the
+# retention window, so its size tracks catalogue x churn x retention. A tight
+# absolute ceiling encodes whatever those happened to be the day it was written:
+# 90000 was set when this service read one 5000-item feed, and the move to all
+# eleven tripled the growth rate without anyone revisiting it. It was breached on
+# 2026-09-19 and then reported a problem on every run for a day while nothing was
+# actually wrong. MIN still earns its place -- a truncated index re-notifies
+# every live deal -- but MAX is now only a runaway backstop, far above any
+# plausible steady state, and the real question (is pruning working?) is asked
+# directly below instead of inferred from a number.
 SEEN_STATE_MIN = 500
-SEEN_STATE_MAX = 90000
+SEEN_STATE_MAX = 250000
 
 # Warn while there is still headroom, rather than after the budget binds.
 RUN_DURATION_WARN_RATIO = 0.87
@@ -585,16 +637,26 @@ def save_seen_deals(seen_deals):
         logging.error(traceback.format_exc())
         return False
 
+def event_pages(kind):
+    """Whether an event kind should escalate the run and alert the user."""
+    return kind not in NOTABLE_EVENTS
+
+
 def record_health_event(kind, detail=""):
     """
     Note a problem for this run's health report.
 
-    Anything recorded here reaches the user: it lands in the run's summary line
-    (which Cloud Monitoring alerts on) and, if it is severe, in an alert email
-    and text.
+    Anything recorded here lands in the run's summary line. A paging kind also
+    escalates the run's status (which Cloud Monitoring alerts on) and, if it is
+    severe enough to survive the cooldown, reaches the user as an email and text.
+    A kind in NOTABLE_EVENTS is recorded and logged but changes neither.
     """
     _health_events.append({"kind": kind, "detail": str(detail)[:300]})
-    logging.error(f"{HEALTH_MARKER}_EVENT kind={kind} detail={detail}")
+    line = f"{HEALTH_MARKER}_EVENT kind={kind} detail={detail}"
+    if event_pages(kind):
+        logging.error(line)
+    else:
+        logging.warning(line)
 
 
 def reset_health_events():
@@ -814,10 +876,19 @@ def _report_run_health(status, metrics):
     state = load_health_state()
 
     events = list(_health_events)
-    if events and status == "ok":
+    # Only a paging event may escalate the run. Notable ones ride along in the
+    # summary line's notes= field so they stay greppable without alerting, and
+    # so status=ok keeps being emitted -- the absence policy watches for exactly
+    # that string, and a run that stopped saying it would eventually fire the
+    # "has not completed a healthy run" alert instead, which is far worse than
+    # the noise being removed.
+    paging = [e for e in events if event_pages(e["kind"])]
+    notable = [e for e in events if not event_pages(e["kind"])]
+    if paging and status == "ok":
         status = "degraded"
 
-    kinds = sorted({e["kind"] for e in events}) or (["none"] if status == "ok" else ["unknown"])
+    kinds = sorted({e["kind"] for e in paging}) or (["none"] if status == "ok" else ["unknown"])
+    notes = sorted({e["kind"] for e in notable})
 
     status, kinds, state = _apply_staleness_check(status, kinds, state, metrics)
 
@@ -832,7 +903,7 @@ def _report_run_health(status, metrics):
         prior = 0
     state["quota"] = {"date": today, "used": prior + _request_count}
     # Remember which feeds are capped so the next run alerts only on a change.
-    current_caps = capped_feeds()
+    current_caps = capped_feeds(state.get("capped_feeds"))
     if current_caps or state.get("capped_feeds"):
         state["capped_feeds"] = current_caps
 
@@ -847,7 +918,11 @@ def _report_run_health(status, metrics):
     # status=ok appears for hours -- the only way to detect the service not
     # running at all, which nothing inside the run can notice.
     detail = " ".join(f"{k}={v}" for k, v in sorted(metrics.items()))
-    summary = f"{HEALTH_MARKER} status={status} problems={','.join(kinds)} {detail}"
+    notes_field = f" notes={','.join(notes)}" if notes else ""
+    summary = (
+        f"{HEALTH_MARKER} status={status} problems={','.join(kinds)}"
+        f"{notes_field} {detail}"
+    )
     if status == "ok":
         logging.info(summary)
     else:
@@ -862,7 +937,11 @@ def _report_run_health(status, metrics):
 
     # Only a fully healthy, complete run may move the baseline. A baseline fed by
     # truncated runs drifts down to meet the failure and disarms the check.
-    if status == "ok" and metrics.get("feed_complete") == "true" and metrics.get("feed_items"):
+    # `not events` rather than `status == "ok"`: notable events no longer
+    # escalate the status, and some of them (feed_shrank, feed_fallback_skipped)
+    # describe exactly the partial run that must not be allowed to set the bar.
+    if (status == "ok" and not events
+            and metrics.get("feed_complete") == "true" and metrics.get("feed_items")):
         sizes = [s for s in state.get("recent_feed_sizes", []) if isinstance(s, int)]
         sizes.append(int(metrics["feed_items"]))
         state["recent_feed_sizes"] = sizes[-FEED_BASELINE_RUNS:]
@@ -878,7 +957,10 @@ def _report_run_health(status, metrics):
             "",
             "Problems:",
         ]
-        lines += [f"  - {e['kind']}: {e['detail']}" for e in events] or ["  - (none recorded)"]
+        lines += [f"  - {e['kind']}: {e['detail']}" for e in paging] or ["  - (none recorded)"]
+        if notable:
+            lines += ["", "Also noted (not alerting):"]
+            lines += [f"  - {e['kind']}: {e['detail']}" for e in notable]
         lines += [
             "",
             "Run details:",
@@ -1152,16 +1234,25 @@ def _fetch_feed_with_fallback(feed_name):
     return _fetch_feed_paginated(feed_name)
 
 
-def capped_feeds():
+def capped_feeds(previous=None):
     """
     Feeds at or near Woot's 5000-item ceiling, and so hiding inventory.
 
     Reported every run for visibility; only a CHANGE in this set is worth
     alerting on, since the already-capped feeds would otherwise alert forever.
+
+    Entry and exit deliberately use different thresholds. With one threshold a
+    feed parked at the warn line crosses it back and forth on ordinary churn and
+    re-reports itself as newly capped each time -- Home did exactly that four
+    times in ten days. A feed already in `previous` therefore stays in the set
+    until it drops below the lower clear line, so only a real change moves it.
     """
-    threshold = WOOT_FEED_ITEM_CAP * FEED_CAP_WARN_RATIO
-    return sorted(name for name, count in (_feed_stats.get("feed_sizes") or {}).items()
-                  if count >= threshold)
+    sizes = _feed_stats.get("feed_sizes") or {}
+    enter = WOOT_FEED_ITEM_CAP * FEED_CAP_WARN_RATIO
+    clear = WOOT_FEED_ITEM_CAP * FEED_CAP_CLEAR_RATIO
+    prev = set(previous or [])
+    return sorted(name for name, count in sizes.items()
+                  if count >= enter or (name in prev and count >= clear))
 
 
 def fetch_feed():
@@ -1773,7 +1864,7 @@ def _run_deal_check():
     check_feed_health(len(feed_items), feed_ids, feed_items, feed_complete)
 
     metrics["feeds"] = f"{_feed_stats.get('feeds_ok', 0)}/{len(FEED_NAMES)}"
-    metrics["capped"] = ",".join(capped_feeds()) or "none"
+    metrics["capped"] = ",".join(_feed_stats.get("capped_now") or capped_feeds()) or "none"
     metrics["raw_items"] = _feed_stats.get("raw_items", 0)
     metrics["pages"] = _feed_stats.get("pages_fetched", 0)
     metrics["rate_limit_hits"] = _feed_stats.get("rate_limit_hits", 0)
@@ -1844,12 +1935,40 @@ def _run_deal_check():
     metrics["deferred"] = len(deferred)
 
     # A state file that reads and writes cleanly can still hold the wrong thing.
-    if not (SEEN_STATE_MIN <= len(seen_deals) <= SEEN_STATE_MAX):
+    # Truncation is the dangerous direction and keeps paging: an index that lost
+    # its contents re-notifies every live deal on Woot. Oversize is not urgent --
+    # the file still works, it is just bigger than expected -- so it only notes.
+    if len(seen_deals) < SEEN_STATE_MIN:
         record_health_event(
             "seen_state_implausible",
-            f"the seen index holds {len(seen_deals)} entries, outside the expected "
-            f"{SEEN_STATE_MIN}-{SEEN_STATE_MAX}"
+            f"the seen index holds only {len(seen_deals)} entries, under the "
+            f"{SEEN_STATE_MIN} floor; matching deals would be re-sent"
         )
+    elif len(seen_deals) > SEEN_STATE_MAX:
+        record_health_event(
+            "seen_state_oversized",
+            f"the seen index holds {len(seen_deals)} entries, over the "
+            f"{SEEN_STATE_MAX} runaway backstop"
+        )
+
+    # Ask the question the old size ceiling was really standing in for. After a
+    # complete run the prune has just executed, so nothing may still be older
+    # than the retention window; anything that is means retention has stopped
+    # working and the file will grow without bound. Stating the invariant
+    # directly means it cannot go stale when the catalogue changes size, which
+    # is exactly how the 90000 ceiling turned into a day of false alarms.
+    if feed_complete and seen_deals:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=SEEN_DEALS_RETENTION_DAYS)
+        ).isoformat()
+        unpruned = sum(1 for v in seen_deals.values()
+                       if isinstance(v, str) and v < cutoff)
+        if unpruned:
+            record_health_event(
+                "seen_state_unpruned",
+                f"{unpruned} entries are older than the "
+                f"{SEEN_DEALS_RETENTION_DAYS}-day retention but survived the prune"
+            )
 
     metrics["duration_s"] = round(RUN_BUDGET_SECONDS - budget_remaining(), 1)
     if metrics["duration_s"] > RUN_BUDGET_SECONDS * RUN_DURATION_WARN_RATIO:
@@ -1970,8 +2089,11 @@ def check_feed_health(feed_items, feed_ids, items, feed_complete):
         _state_for_checks = load_health_state()
     except Exception:
         _state_for_checks = {}
-    newly_capped = [f for f in capped_feeds()
-                    if f not in set(_state_for_checks.get("capped_feeds") or [])]
+    _prev_caps = _state_for_checks.get("capped_feeds") or []
+    # Stash the deadbanded set so the summary line reports the same thing that
+    # gets stored and compared, rather than the raw at-or-above-entry set.
+    _feed_stats["capped_now"] = capped_feeds(_prev_caps)
+    newly_capped = [f for f in _feed_stats["capped_now"] if f not in set(_prev_caps)]
     if newly_capped:
         record_health_event(
             "feed_newly_capped",

@@ -119,35 +119,68 @@ Every run ends by classifying itself:
 deliberately: an immediate scheduler retry would just spend more of the Woot
 rate-limit budget, and the alert below is the better signal.
 
-Conditions that mark a run `degraded` or `failed`:
+Health events come in two tiers. **Paging** events mark the run `degraded` or
+`failed`, which is what the alert policy counts, and can reach the user as an
+email and text. **Notable** events are recorded and logged, and appear in the
+summary line's `notes=` field, but leave the run `ok` and never alert.
+
+The split exists because it once did not. Every one of these conditions used to
+escalate the run, so a harmless one - the seen index drifting past an ageing
+size ceiling - reported a problem every 30 minutes for a day in September 2026.
+The cost of that is not the annoyance: a real failure arriving in the middle of
+it would have been invisible.
+
+The test for the notable tier is "what would I do about it at 3am?". If the
+answer is nothing, it does not page.
+
+Paging - the tracker is broken, blind, or would spam you:
 
 | Problem | Meaning |
 |---|---|
 | `feed_incomplete` | the feed was cut short - the original bug |
 | `feed_too_small` | fewer than `FEED_SIZE_FLOOR` items came back |
-| `feed_shrank` | feed is under `FEED_SHRINK_RATIO` of its recent median |
 | `feed_coverage_partial` | fewer than all 11 feeds were read, so the catalogue seen is incomplete |
 | `feed_schema_invalid` | `TotalPages` or `Items` missing or changed type |
-| `feed_newly_capped` | a feed newly hit Woot's 5000-item ceiling; offers past it are unreachable |
-| `feed_fallback_skipped` | a feed needed the expensive paginated retry and the day's request budget could not afford it |
 | `feed_text_missing` | feed items lost their titles, so the matcher sees nothing |
 | `feed_not_changing` | no new offers for `NO_NEW_ITEMS_RUNS` runs; feed stale or seen-index wrong |
-| `feed_outgrowing_budget` | a feed reports more pages than the paginated fallback could read |
 | `feed_empty` | the feed returned nothing |
-| `detail_fetch_incomplete` | candidate offers could not be keyword-checked |
 | `notification_failed` | matching deals could not be sent |
-| `deal_format_failed` | an offer could not be formatted and was skipped |
 | `seen_state_unreadable` | state could not be read; the run aborts rather than re-alert everything |
 | `seen_state_unwritable` | state could not be saved; would otherwise re-send every deal hourly |
-| `seen_state_implausible` | state reads and writes fine but holds an implausible number of entries |
-| `run_near_deadline` | the run is approaching its time budget |
+| `seen_state_implausible` | the index is under `SEEN_STATE_MIN`; truncated state re-notifies every live deal |
 | `storage_client_uninitialized` | Cloud Storage was unavailable at startup |
 | `missing_env_vars` | a required setting is unset |
 | `unhandled_exception` | anything otherwise uncaught |
 
+`feed_text_missing` and `feed_not_changing` are deliberately in this tier. Both
+describe the pipeline looking healthy while observing or matching nothing, which
+is the exact failure this service was written after, and `canary_hits` is only
+observed and never checked - so these two are the only guards against it.
+
+Notable - context for whoever is already looking, listed in `NOTABLE_EVENTS`:
+
+| Note | Meaning |
+|---|---|
+| `feed_newly_capped` | a feed newly hit Woot's 5000-item ceiling; offers past it are unreachable |
+| `feed_shrank` | feed is under `FEED_SHRINK_RATIO` of its recent median |
+| `feed_fallback_skipped` | a feed needed the expensive paginated retry and the day's request budget could not afford it |
+| `feed_outgrowing_budget` | a feed reports more pages than the paginated fallback could read |
+| `detail_fetch_incomplete` | candidate offers could not be keyword-checked |
+| `deal_format_failed` | an offer could not be formatted and was skipped |
+| `seen_state_oversized` | the index passed `SEEN_STATE_MAX`, a loose runaway backstop |
+| `seen_state_unpruned` | entries older than the retention window survived the prune, so retention has stopped working |
+| `run_near_deadline` | the run is approaching its time budget |
+
+An event kind that is not named in `NOTABLE_EVENTS` pages. That default is
+deliberate: forgetting to classify a new check should over-alert, never
+silently disable it.
+
 Several of these overlap deliberately. The original truncation now trips
-`feed_incomplete`, `feed_too_small` and `feed_shrank` together - independent
-detectors for one fault, collapsed into a single alert by the signature rule.
+`feed_incomplete` and `feed_too_small` in the paging tier and notes
+`feed_shrank` alongside them - independent detectors for one fault, collapsed
+into a single alert by the signature rule. The overlap is why `feed_shrank` can
+sit in the notable tier without losing coverage: it is a relative dip, and when
+the cause is structural the two paging checks fire with it.
 
 Two design notes worth keeping in mind when tuning:
 
@@ -205,10 +238,23 @@ cannot email about a broken email path. Two alert policies in the
 Every run emits exactly one machine-readable line that these key off:
 
 ```
-WOOT_HEALTH status=ok problems=none capped=All,Clearance,Home,Sports duration_s=26.3
-feed_complete=true feed_items=13618 feeds=11/11 matches=0 quota_used=352/1000
-raw_items=23902 requests=11 seen_deals=63740 ...
+WOOT_HEALTH status=ok problems=none canary_hits=102 capped=All deferred=0
+duration_s=20.8 feed_complete=true feed_items=9124 feeds=11/11 matches=0
+new_items=0 notified=false pages=0 quota_used=352/1000 raw_items=17033
+rate_limit_hits=0 requests=11 seen_deals=90797
 ```
+
+`problems=` lists paging events only. When a notable event fires, a `notes=`
+field appears after it and the status stays `ok`:
+
+```
+WOOT_HEALTH status=ok problems=none notes=feed_newly_capped capped=All,Home ...
+```
+
+That the status stays `ok` is load-bearing, not cosmetic. The absence policy
+below watches for the literal string `status=ok`, so an event that suppressed it
+on every run would eventually fire "has not completed a healthy run" - which
+means the service is dead - in place of the harmless alert being removed.
 
 To see recent health lines:
 
