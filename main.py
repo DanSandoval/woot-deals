@@ -226,11 +226,18 @@ CANARY_KEYWORD = "refurbished"
 # the transition into a problem, then at most once per cooldown while it lasts.
 ALERT_COOLDOWN_HOURS = 12
 
-# Woot's catalogue turns over daily, so a full day of hourly runs seeing nothing
-# new means the feed is stale or the seen-index is wrong -- the pipeline looking
-# alive while no longer actually observing anything, which is how the original
-# bug presented. A single run with no new offers is perfectly normal.
-NO_NEW_ITEMS_RUNS = 24
+# Woot's catalogue turns over daily, so a full day of seeing nothing new means
+# the feed is stale or the seen-index is wrong -- the pipeline looking alive
+# while no longer actually observing anything, which is how the original bug
+# presented. A single run with no new offers is perfectly normal.
+#
+# Measured in HOURS, not runs. This was "24 runs", which meant a day only while
+# the schedule was hourly; the move to every 30 minutes on 2026-08-27 quietly
+# halved it to twelve hours without anyone noticing, and it then fired on
+# 2026-09-20 during an ordinary slow Sunday. Sixteen days of history put the
+# normal daily quiet stretch at 8-9h and the observed maximum at 14.5h, so a day
+# is both the rule's original intent and a comfortable margin over reality.
+NO_NEW_ITEMS_HOURS = 24
 
 # Backstops against a bug in the alerter itself: never let one logic error turn
 # into unbounded texts.
@@ -842,29 +849,50 @@ def report_run_health(status, metrics):
         return status
 
 
-def _apply_staleness_check(status, kinds, state, metrics):
+def _apply_staleness_check(status, kinds, state, metrics, now):
     """
     Flag a feed that has stopped changing.
 
     A single run with no new offers is normal; a full day of them means the feed
     is stale or the seen-index is wrong -- the pipeline looking alive while no
     longer actually observing anything.
+
+    Elapsed time is the thing this rule was always about, so it is what gets
+    measured. Counting runs instead made the threshold depend on the schedule,
+    and when the cadence changed the same number silently came to mean half as
+    long. A timestamp cannot drift that way.
+
+    Note this check only runs while the status is still "ok": a run already
+    reporting a problem has a better explanation than "nothing new appeared".
+    That also means a persistently noisy check will suppress this one, which is
+    how it sat dormant through the September 2026 alert flood.
     """
     if status != "ok" or "new_items" not in metrics:
         return status, kinds, state
 
+    # Retired by the switch to wall-clock time; dropped so the state file stops
+    # carrying a value nothing reads.
+    state.pop("consecutive_no_new_runs", None)
+
     if int(metrics["new_items"]) != 0:
-        state["consecutive_no_new_runs"] = 0
+        state["last_new_item_seen"] = now.isoformat()
         return status, kinds, state
 
-    stale_runs = int(state.get("consecutive_no_new_runs", 0)) + 1
-    state["consecutive_no_new_runs"] = stale_runs
-    if stale_runs < NO_NEW_ITEMS_RUNS:
+    try:
+        quiet_for = now - datetime.fromisoformat(state["last_new_item_seen"])
+    except (KeyError, TypeError, ValueError):
+        # Nothing usable to measure from -- first run on a new state file, or a
+        # corrupted value. Start the clock rather than alert about a gap whose
+        # length is unknown.
+        state["last_new_item_seen"] = now.isoformat()
+        return status, kinds, state
+
+    if quiet_for < timedelta(hours=NO_NEW_ITEMS_HOURS):
         return status, kinds, state
 
     record_health_event(
         "feed_not_changing",
-        f"no new offers across {stale_runs} consecutive runs; "
+        f"no new offers for {quiet_for.total_seconds() / 3600:.1f}h; "
         f"the feed may be stale or the seen-index wrong"
     )
     kinds = sorted(set(kinds) - {"none"} | {"feed_not_changing"})
@@ -890,7 +918,7 @@ def _report_run_health(status, metrics):
     kinds = sorted({e["kind"] for e in paging}) or (["none"] if status == "ok" else ["unknown"])
     notes = sorted({e["kind"] for e in notable})
 
-    status, kinds, state = _apply_staleness_check(status, kinds, state, metrics)
+    status, kinds, state = _apply_staleness_check(status, kinds, state, metrics, now)
 
     # Carry the day's request spend forward so the next run knows what is left.
     # Keyed by UTC date because that is when the Woot quota resets; a record from

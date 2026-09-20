@@ -1272,5 +1272,96 @@ class SeenStateChecksTest(PipelineTestBase):
             self.assertNotIn(kind, kinds)
 
 
+class FeedStalenessTest(unittest.TestCase):
+    """
+    The staleness check: the pipeline looking alive while observing nothing.
+
+    Measured in elapsed hours because counting runs tied the threshold to the
+    schedule. "24 runs" meant a day at the hourly cadence it was written for and
+    silently became twelve hours when runs moved to every 30 minutes, which is
+    what made it fire during an ordinary slow Sunday in September 2026. Before
+    that this check had no test of its own, which is how the drift went unseen.
+    """
+
+    def setUp(self):
+        main.reset_health_events()
+        self.now = datetime(2026, 9, 20, 19, 0, tzinfo=timezone.utc)
+
+    def _check(self, state, new_items=0, status="ok"):
+        main.reset_health_events()
+        return main._apply_staleness_check(
+            status, ["none"], dict(state), {"new_items": new_items}, self.now)
+
+    def _quiet_since(self, hours):
+        return {"last_new_item_seen":
+                (self.now - timedelta(hours=hours)).isoformat()}
+
+    def test_a_normal_quiet_stretch_says_nothing(self):
+        # 8-9h is the ordinary daily gap between Woot restocks, seen on every
+        # one of sixteen consecutive days.
+        status, _, _ = self._check(self._quiet_since(9))
+        self.assertEqual(status, "ok")
+        self.assertEqual(main._health_events, [])
+
+    def test_the_slow_sunday_that_caused_this_no_longer_fires(self):
+        # 2026-09-20: 14.5h without a new offer, the longest gap in sixteen days
+        # and still ordinary -- Woot simply skipped an afternoon restock. Under
+        # the old 24-RUN threshold that was 29 runs and alerted. Under 24 HOURS
+        # it is quiet, which is what the rule always meant to say.
+        status, _, _ = self._check(self._quiet_since(14.5))
+        self.assertEqual(status, "ok")
+        self.assertEqual(main._health_events, [])
+
+    def test_a_full_day_without_new_offers_is_flagged(self):
+        status, kinds, _ = self._check(self._quiet_since(25))
+        self.assertEqual(status, "degraded")
+        self.assertIn("feed_not_changing", kinds)
+        self.assertEqual([e["kind"] for e in main._health_events],
+                         ["feed_not_changing"])
+
+    def test_the_boundary_is_the_configured_hours(self):
+        under = self._check(self._quiet_since(main.NO_NEW_ITEMS_HOURS - 0.1))[0]
+        over = self._check(self._quiet_since(main.NO_NEW_ITEMS_HOURS + 0.1))[0]
+        self.assertEqual(under, "ok")
+        self.assertEqual(over, "degraded")
+
+    def test_new_offers_restart_the_clock(self):
+        _, _, state = self._check(self._quiet_since(30), new_items=5)
+        self.assertEqual(state["last_new_item_seen"], self.now.isoformat())
+        self.assertEqual(main._health_events, [])
+
+    def test_no_recorded_timestamp_starts_the_clock_instead_of_alerting(self):
+        # A fresh state file must not alert about a gap it cannot measure.
+        status, _, state = self._check({})
+        self.assertEqual(status, "ok")
+        self.assertEqual(state["last_new_item_seen"], self.now.isoformat())
+        self.assertEqual(main._health_events, [])
+
+    def test_a_corrupt_timestamp_starts_the_clock_instead_of_alerting(self):
+        status, _, state = self._check({"last_new_item_seen": "not a date"})
+        self.assertEqual(status, "ok")
+        self.assertEqual(state["last_new_item_seen"], self.now.isoformat())
+
+    def test_the_retired_run_counter_is_dropped(self):
+        _, _, state = self._check(
+            dict(self._quiet_since(1), consecutive_no_new_runs=24))
+        self.assertNotIn("consecutive_no_new_runs", state)
+
+    def test_an_already_failing_run_is_left_alone(self):
+        # A run that already has a problem has a better explanation than
+        # "nothing new appeared". This is also why a persistently noisy check
+        # suppresses this one: throughout the September 2026 flood every run was
+        # degraded, so this check never ran at all.
+        status, _, _ = self._check(self._quiet_since(99), status="degraded")
+        self.assertEqual(status, "degraded")
+        self.assertEqual(main._health_events, [])
+
+    def test_the_threshold_clears_the_observed_maximum_gap(self):
+        # Sixteen days of production history: ordinary daily gap 8-9h, longest
+        # observed 14.5h. A threshold at or under that is a false-alarm
+        # generator, which is exactly what 24 runs (12h) had become.
+        self.assertGreater(main.NO_NEW_ITEMS_HOURS, 14.5)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)

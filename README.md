@@ -142,7 +142,7 @@ Paging - the tracker is broken, blind, or would spam you:
 | `feed_coverage_partial` | fewer than all 11 feeds were read, so the catalogue seen is incomplete |
 | `feed_schema_invalid` | `TotalPages` or `Items` missing or changed type |
 | `feed_text_missing` | feed items lost their titles, so the matcher sees nothing |
-| `feed_not_changing` | no new offers for `NO_NEW_ITEMS_RUNS` runs; feed stale or seen-index wrong |
+| `feed_not_changing` | no new offers for `NO_NEW_ITEMS_HOURS`; feed stale or seen-index wrong |
 | `feed_empty` | the feed returned nothing |
 | `notification_failed` | matching deals could not be sent |
 | `seen_state_unreadable` | state could not be read; the run aborts rather than re-alert everything |
