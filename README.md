@@ -146,7 +146,7 @@ Paging - the tracker is broken, blind, or would spam you:
 | `feed_empty` | the feed returned nothing |
 | `notification_failed` | matching deals could not be sent |
 | `seen_state_unreadable` | state could not be read; the run aborts rather than re-alert everything |
-| `seen_state_unwritable` | state could not be saved; would otherwise re-send every deal hourly |
+| `seen_state_unwritable` | state could not be saved; would otherwise re-send every deal every run |
 | `seen_state_implausible` | the index is under `SEEN_STATE_MIN`; truncated state re-notifies every live deal |
 | `storage_client_uninitialized` | Cloud Storage was unavailable at startup |
 | `missing_env_vars` | a required setting is unset |
@@ -186,7 +186,8 @@ Two design notes worth keeping in mind when tuning:
 
 - **`FEED_SIZE_FLOOR` must sit above the failure it catches.** The original
   truncation returned ~1300 items. A floor of 1000 would have sat silently
-  through the exact bug it was added for. It is 3000.
+  through the exact bug it was added for. It is 6000, chosen to sit above the
+  5000 that the `All` feed alone returns.
 - **Only fully healthy runs move the baseline.** `feed_shrank` compares against
   the median of recent complete, healthy runs. If truncated runs fed the
   baseline it would drift down to meet the failure and quietly disarm itself -
@@ -198,15 +199,33 @@ a problem first appears and then at most once per `ALERT_COOLDOWN_HOURS` while
 the same problem persists. A different problem alerts immediately. When things
 recover, a single "recovered" message is sent.
 
+Two consequences worth knowing before tuning anything here:
+
+- **The cooldown decouples texts from log noise.** When `seen_state_implausible`
+  fired on all 48 runs of 2026-09-20, it produced 3 texts, not 48. Counting
+  `WOOT_HEALTH_EVENT` lines in the logs badly overstates what the user received;
+  count `Health alert sent` instead.
+- **Every incident costs two messages** - the problem, then the matching
+  "recovered". A transient blip that clears by itself still sends both. This is
+  deliberate (silence is ambiguous) but it does double the volume, and it is the
+  obvious thing to change if alerts still feel too frequent.
+
 ### The canary (not yet armed)
 
 `CANARY_KEYWORD` counts feed items mentioning a term Woot always has live, using
 text already fetched - no extra API calls. It exercises the real matching
-pipeline every hour with a guaranteed-positive case, so a matcher regression
+pipeline every run with a guaranteed-positive case, so a matcher regression
 shows up within hours instead of whenever a Kindle next happens to go on sale.
 
 It is **observe-only**: `canary_hits` appears in the health line but nothing
-alerts on it. Before arming it, confirm the term really does appear in every run:
+alerts on it. **This is the service's largest remaining blind spot.** A bug in
+the matching logic itself - titles present, offers flowing, but `matched_keywords`
+silently returning nothing - fires no check: `feed_text_missing` sees titles and
+`feed_not_changing` sees new offers. Those two only guard the problem
+indirectly, which is why neither may be demoted to the notable tier.
+
+Readings have run 94-102 over the last month. Before arming it, confirm the term
+really does appear in every run:
 
 ```
 gcloud logging read 'resource.type="cloud_run_revision" AND resource.labels.service_name="woot-deals" AND textPayload=~"WOOT_HEALTH"' --project=woot-deals-tracker --limit=200 --format='value(textPayload)' | grep -o 'canary_hits=[0-9]*' | sort | uniq -c
