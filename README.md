@@ -8,8 +8,10 @@ This service:
 - Polls all 11 Woot feeds every 30 minutes and merges them into one
   deduplicated catalogue (~13,600 offers), because the `All` feed alone is
   capped at 5000 items and shows only ~40% of what is for sale
-- Filters deals based on configurable keywords
-- Sends email notifications for matching deals
+- Filters deals by a keyword list you edit by email (see Configuration)
+- Asks Jev (TypeSafe) whether each new match is really the product, so
+  accessories and look-alike words are emailed but not texted
+- Sends a text and an email for matching deals
 - Tracks previously seen deals to avoid duplicates
 - Runs on Google Cloud Platform's free tier
 
@@ -21,6 +23,8 @@ This service:
 - `test_service.py` - Testing script for the deployed service
 - `test_api_endpoints.py` - Script to test Woot API connectivity
 - `test_pipeline.py` - Offline tests for the deal-checking pipeline (no credentials needed)
+- `test_jev_live.py` - Live check of the Jev screen against labelled listings (needs `TYPESAFE_API_KEY`)
+- `testdata/jev_corpus.json` - 120 labelled listings: 49 live Woot offers and 71 hard cases
 
 ## Setup Instructions
 
@@ -81,6 +85,15 @@ keyword matching, seen-deal state, notifications):
 python test_pipeline.py
 ```
 
+To check the Jev screen against the real TypeSafe API (skipped without
+`TYPESAFE_API_KEY`; about $0.004 a run). Run it before changing `JEV_MODEL`,
+`JEV_DROP_BELOW`, the questions or the product descriptions - it fails if any
+wanted listing would be set aside:
+
+```
+python test_jev_live.py
+```
+
 To test only the API connectivity:
 
 ```
@@ -89,7 +102,58 @@ python test_api_endpoints.py --api-key YOUR-WOOT-API-KEY
 
 ## Configuration
 
-Modify the `KEYWORDS` list in `main.py` to customize which products you're interested in.
+### Keywords
+
+The list lives in the bucket as `keywords.json` and is changed by email. Send a
+message **to the tracker's Gmail account** (`GMAIL_USER`) with the command as the
+subject line:
+
+| Subject | Effect |
+|---|---|
+| `woot add lego, switch 2` | add one or more keywords |
+| `woot remove kindle` | remove one or more (`delete` works too) |
+| `woot list` | change nothing, just reply with the list |
+
+Each run (every 30 minutes) applies waiting commands before matching, so a new
+keyword already catches new listings in that run. The reply lists the result, the
+whole list, and the offers on Woot that match a new keyword right now. Those were
+already seen and will not alert; only listings that appear later do.
+
+Rules:
+- Only the owner can change the list. Mail sent from `GMAIL_USER` to itself is
+  accepted because Gmail files it under `\Sent`, which a forged message cannot
+  get. Other addresses must be listed in `COMMAND_SENDERS` (comma-separated env
+  var) and pass Gmail's own DMARC check. Anything else is ignored, labelled so
+  it is not re-read, and never answered.
+- A keyword needs at least 3 letters or digits, at most 40 characters, and is
+  refused if it matches more than 5% of the live catalogue. The list holds at
+  most 60 and the last one cannot be removed.
+- Handled commands get the Gmail label `woot-processed`. Only headers are read;
+  mail whose subject is not a command is never touched.
+- `DEFAULT_KEYWORDS` in `main.py` only seeds `keywords.json` the first time it
+  is missing. After that, editing it changes nothing in production.
+
+### Jev screening
+
+Substring matching also catches accessories ("MacBook Pro 14 Sleeve") and words
+that contain a keyword ("Waste Ink" contains "e ink", "Chinook" contains "nook").
+Each new match is sent to Jev with a description of the product the keyword
+means. If Jev scores it below `JEV_DROP_BELOW` (0.2) for every product it
+matched, it is listed in the email under "Filtered out" and not texted. It is
+still recorded as seen.
+
+- Measured 2026-09-27 on the labelled corpus: no wanted listing set aside, every
+  accessory and look-alike set aside outside Montessori.
+- Only keywords in `JEV_KEYWORD_PRODUCT` are screened. `montessori` is left out
+  on purpose (Jev scored real Montessori shelves as low as 0.11), and keywords
+  added by email are never screened, because an untested description could
+  drop real deals.
+- It fails open. With no `TYPESAFE_API_KEY`, on any error or timeout, or when
+  the run is short on time, matches are texted exactly as before, and
+  `jev_unavailable` is noted.
+- Production needs its own TypeSafe key (create one at
+  https://console.typesafe.ai/keys), set as the Cloud Run env var
+  `TYPESAFE_API_KEY`. Do not reuse a development key.
 
 ## Monitoring
 
@@ -146,6 +210,7 @@ Paging - the tracker is broken, blind, or would spam you:
 | `feed_empty` | the feed returned nothing |
 | `notification_failed` | matching deals could not be sent |
 | `seen_state_unreadable` | state could not be read; the run aborts rather than re-alert everything |
+| `keywords_unreadable` | `keywords.json` could not be read; the run aborts rather than mark offers seen unchecked |
 | `seen_state_unwritable` | state could not be saved; would otherwise re-send every deal every run |
 | `seen_state_implausible` | the index is under `SEEN_STATE_MIN`; truncated state re-notifies every live deal |
 | `storage_client_uninitialized` | Cloud Storage was unavailable at startup |
@@ -170,6 +235,9 @@ Notable - context for whoever is already looking, listed in `NOTABLE_EVENTS`:
 | `seen_state_oversized` | the index passed `SEEN_STATE_MAX`, a loose runaway backstop |
 | `seen_state_unpruned` | entries older than the retention window survived the prune, so retention has stopped working |
 | `run_near_deadline` | the run is approaching its time budget |
+| `keyword_commands_failed` | the inbox could not be read or a change not saved; the current list keeps working |
+| `keyword_command_rejected` | a command from an unverified sender was ignored |
+| `jev_unavailable` | Jev could not judge some matches; they were texted unscreened |
 
 An event kind that is not named in `NOTABLE_EVENTS` pages. That default is
 deliberate: forgetting to classify a new check should over-alert, never
@@ -298,9 +366,11 @@ returns 404, so pagination cannot reach past it either. Verified 2026-08-31.
 Measured that day, `All`, `Clearance`, `Home` and `Sports` were all at or near the
 ceiling while `Electronics` (~19%) and `Computers` (~17%) had plenty of room.
 Since this tracker's e-reader, AirTag and Mac mini keywords live in the uncapped
-feeds, the hidden inventory is mostly home goods. (Which feed 3D printers land in
-has not been measured; if it is `Home` or `Tools` near the ceiling, some can be
-hidden.) **That is the only
+feeds, the hidden inventory is mostly home goods. The newer keywords are less
+comfortable: where 3D printers and Montessori toys are filed has not been
+measured, and toys in particular are likely to sit in `Home`, which held 4898
+items on 2026-09-27 - about 100 short of the ceiling. Once it reaches 5000, offers
+past it are unreachable by any request. **That is the only
 reason the cap is tolerable** - if `Electronics` or `Computers` ever approach 5000,
 real deals start being hidden, which is what `feed_newly_capped` exists to catch.
 

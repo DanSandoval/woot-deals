@@ -2,8 +2,13 @@ import requests
 import json
 import logging
 import smtplib
+import ssl
+import imaplib
+import re
+from email import message_from_bytes, policy as email_policy
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.utils import parseaddr
 from datetime import datetime, timedelta, timezone
 import os
 from google.cloud import storage
@@ -12,6 +17,7 @@ import traceback
 import time
 from flask import Flask, request
 import random
+import html
 
 # Set up detailed logging
 logging.basicConfig(
@@ -38,8 +44,14 @@ FEED_NAMES = ["All", "Clearance", "Computers", "Electronics", "Featured",
 FEED_PAGE_SIZE = 100
 
 GETOFFERS_ENDPOINT = "https://developer.woot.com/getoffers"
-KEYWORDS = ["kindle", "ereader", "e-reader", "e-ink", "kobo", "nook", "eink",
-            "airtag", "air-tag", "mac mini", "3d printer", "3-d printer"]
+
+# The SEED for the keyword list, not the live list. Production reads
+# keywords.json from the bucket, which the user edits by emailing commands (see
+# process_keyword_commands); this constant only fills that file the first time
+# it is missing. After that, editing it here changes nothing in production.
+DEFAULT_KEYWORDS = ["kindle", "ereader", "e-reader", "e-ink", "kobo", "nook", "eink",
+                    "airtag", "air-tag", "mac mini", "3d printer", "3-d printer",
+                    "montessori", "macbook air", "macbook pro", "mac studio"]
 # Both AirTag spellings are listed for the same reason as ereader/e-reader:
 # normalize_text flattens hyphens, so "air-tag" covers "Air Tag" and
 # "Air-Tag" while "airtag" covers Apple's own one-word branding. Matching is
@@ -49,6 +61,12 @@ KEYWORDS = ["kindle", "ereader", "e-reader", "e-ink", "kobo", "nook", "eink",
 # "3D-Printer" and the plural, but "3-D Printer" flattens to "3 d printer", so
 # that spelling is listed separately. Accessories named after the product
 # ("Stand for Mac mini", "3D Printer Filament") match too, as AirTag cases do.
+# "montessori" is the toy keyword: it is a descriptor sellers put in the title
+# rather than a brand, so one entry covers every product ("Montessori Busy
+# Board", "Montessori Toys for 1 Year Old") and the substring match picks up
+# "Montessori-Style" and the possessive on its own. The three Mac laptops and
+# desktops follow the "mac mini" rule: one entry each, with the same accessory
+# caveat ("MacBook Pro 14 Sleeve" matches).
 
 
 def normalize_text(text):
@@ -56,7 +74,21 @@ def normalize_text(text):
     return text.replace("-", " ").lower()
 
 
-NORMALIZED_KEYWORDS = [normalize_text(k) for k in KEYWORDS]
+# The list every matcher in this process uses. A run replaces it with the
+# bucket's copy; until then it holds the defaults, which is what the offline
+# tests and the diagnostic endpoints match against.
+_keywords = []
+_normalized_keywords = []
+
+
+def set_keywords(keywords):
+    """Make `keywords` the live list for matching."""
+    global _keywords, _normalized_keywords
+    _keywords = list(keywords)
+    _normalized_keywords = [normalize_text(k) for k in _keywords]
+
+
+set_keywords(DEFAULT_KEYWORDS)
 
 
 def matched_keywords(text):
@@ -64,7 +96,7 @@ def matched_keywords(text):
     if not isinstance(text, str) or not text:
         return []
     haystack = normalize_text(text)
-    return [KEYWORDS[i] for i, k in enumerate(NORMALIZED_KEYWORDS) if k in haystack]
+    return [_keywords[i] for i, k in enumerate(_normalized_keywords) if k in haystack]
 
 # Gmail configuration
 GMAIL_USER = os.environ.get("GMAIL_USER")
@@ -74,6 +106,97 @@ EMAIL_RECIPIENT = os.environ.get("EMAIL_RECIPIENT")
 # GCS configuration
 BUCKET_NAME = os.environ.get("BUCKET_NAME")
 SEEN_DEALS_FILENAME = "seen_deals.json"
+
+# --- Keyword commands by email ------------------------------------------------
+# The keyword list lives in the bucket and is edited by emailing the tracker's
+# own Gmail account with a subject like "woot add lego". Each run reads the
+# inbox over IMAP with the same app password it already sends mail with.
+KEYWORDS_FILENAME = "keywords.json"
+IMAP_HOST = "imap.gmail.com"
+IMAP_TIMEOUT = 20  # seconds, per socket operation
+# Addresses besides GMAIL_USER itself that may send commands, comma-separated.
+# Kept out of the code because the repository is public.
+COMMAND_SENDERS = os.environ.get("COMMAND_SENDERS", "")
+# Gmail label put on every command once it has been handled, so it is never
+# applied twice. Read/unread state is not used for this: opening the email on
+# a phone before the next run would otherwise make the command vanish.
+COMMAND_LABEL = "woot-processed"
+COMMAND_LOOKBACK_DAYS = 3
+MAX_COMMANDS_PER_RUN = 10    # verified commands applied per run
+MAX_COMMAND_CANDIDATES = 50  # messages whose headers are read per run
+MAX_KEYWORDS = 60
+KEYWORD_MIN_CHARS = 3   # letters/digits; "tv" or "a" would match nearly everything
+KEYWORD_MAX_CHARS = 40
+# A keyword matching more than this share of live offers is refused. At that
+# breadth it would text on almost every run and spend the detail-fetch budget
+# on things nobody asked about. For scale, "refurbished" matches about 1%.
+MAX_KEYWORD_MATCH_RATIO = 0.05
+# --- Screening matches with Jev -------------------------------------------------
+# Keywords match by substring, so they also catch accessories ("Case for Kindle
+# Paperwhite") and words that merely contain a keyword ("Waste Ink" contains
+# "e ink"). Jev, TypeSafe's judgment model, is asked whether each new match is
+# really the product. Anything it rules out is still listed in the alert email,
+# just not texted, so a wrong call costs a text, never a deal.
+#
+# Measured 2026-09-27 on testdata/jev_corpus.json: 120 labelled listings, 49
+# live from Woot and 71 built as hard cases. With this model and threshold no
+# wanted listing was set aside and every accessory and look-alike outside
+# Montessori was. Outside Montessori the lowest wanted listing scored 0.90 and
+# the highest non-wanted one 0.06. test_jev_live.py re-checks this. The threshold sits at the
+# non-wanted end on purpose: an extra accessory text is cheap, a missed deal is
+# not. Re-measure before changing JEV_MODEL, the questions or the descriptions.
+TYPESAFE_API_KEY = os.environ.get("TYPESAFE_API_KEY")  # unset = no screening
+JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
+JEV_MODEL = "jev-1.13.0"  # pinned: the threshold was measured on this version
+JEV_DROP_BELOW = 0.2
+JEV_TIMEOUT = 10  # seconds per request
+JEV_MAX_ATTEMPTS = 3
+JEV_DETAIL_CHARS = 600  # per text field; Jev judges worse with long irrelevant text
+
+JEV_PRODUCTS = {
+    "ereader": "An e-reader or e-ink tablet: a device for reading ebooks or writing "
+               "on an e-paper screen, such as an Amazon Kindle, Kobo, Barnes & Noble "
+               "Nook, reMarkable or BOOX. New, refurbished or used, alone or in a "
+               "bundle that includes the device.",
+    "airtag": "Apple AirTag item trackers, single or multi-pack, alone or in a "
+              "bundle that includes at least one AirTag.",
+    "mac_mini": "An Apple Mac mini desktop computer, any year or configuration, "
+                "new, refurbished or used, alone or in a bundle that includes it.",
+    "mac_studio": "An Apple Mac Studio desktop computer, any configuration, new, "
+                  "refurbished or used, alone or in a bundle that includes it.",
+    "macbook_air": "An Apple MacBook Air laptop, any year or configuration, new, "
+                   "refurbished or used, alone or in a bundle that includes it.",
+    "macbook_pro": "An Apple MacBook Pro laptop, any year or configuration, new, "
+                   "refurbished or used, alone or in a bundle that includes it.",
+    "printer3d": "A 3D printer: the printing machine itself (filament or resin), "
+                 "alone or in a bundle or combo that includes the printer.",
+}
+JEV_ACCESSORY_EXAMPLES = ("a case, cover, sleeve, skin, screen protector, charger, "
+                          "cable, adapter, stand, dock, hub, mount, holder, keychain, "
+                          "strap, filament, resin, nozzle, enclosure or replacement part")
+
+# Which description judges which keyword, keyed by the normalized keyword so
+# "air tag" typed into an email finds the "air-tag" entry. A keyword absent from
+# here is never screened. That includes everything added by email, and
+# "montessori" deliberately: it is a descriptor rather than a product, Jev
+# scored real Montessori shelves as low as 0.11, and the word does not hide
+# inside other words, so there is little to screen out and real deals to lose.
+JEV_KEYWORD_PRODUCT = {normalize_text(k): product for k, product in {
+    "kindle": "ereader", "ereader": "ereader", "e-reader": "ereader",
+    "e-ink": "ereader", "eink": "ereader", "kobo": "ereader", "nook": "ereader",
+    "remarkable": "ereader",  # not a default keyword; judged on real reMarkables
+    "airtag": "airtag", "air-tag": "airtag",
+    "mac mini": "mac_mini", "mac studio": "mac_studio",
+    "macbook air": "macbook_air", "macbook pro": "macbook_pro",
+    "3d printer": "printer3d", "3-d printer": "printer3d",
+}.items()}
+
+KEYWORD_COMMAND_HELP = [
+    "To change the list, email this address with one of these as the subject:",
+    "  woot add <keyword>, <keyword>, ...",
+    "  woot remove <keyword>, <keyword>, ...",
+    "  woot list",
+]
 
 # Rate limiting configuration
 MAX_RETRIES = 5
@@ -105,6 +228,9 @@ PAGINATED_FETCH_COST = 55
 # only burn more rate-limit budget.
 RUN_BUDGET_SECONDS = 150
 FEED_BUDGET_RESERVE = 45  # keep this much of the budget for the detail fetch
+# Keyword commands run between the feed and the detail fetch, so they leave the
+# detail fetch its reserve plus one slow IMAP round trip.
+COMMANDS_BUDGET_RESERVE = FEED_BUDGET_RESERVE + IMAP_TIMEOUT
 MAX_FEED_PAGES = 200  # guard against a runaway TotalPages value
 
 # An offer that has not appeared in the feed for this long is dropped from the
@@ -151,6 +277,9 @@ NOTABLE_EVENTS = frozenset({
     "deal_format_failed",      # one offer rendered badly
     "seen_state_oversized",    # growth backstop, not a malfunction
     "seen_state_unpruned",     # retention is not dropping anything; real but slow
+    "keyword_commands_failed", # inbox unreachable; the current list keeps working
+    "keyword_command_rejected",# a command from an unverified sender was ignored
+    "jev_unavailable",         # matches were texted unscreened; nothing was lost
 })
 
 # The floor has to sit ABOVE the failure it exists to catch: the original
@@ -525,7 +654,7 @@ def test_email():
         # Send the email
         logging.info(f"Attempting to send test email from {GMAIL_USER} to {EMAIL_RECIPIENT}")
         
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=ssl.create_default_context()) as server:
             try:
                 logging.info("Connecting to SMTP server...")
                 server.ehlo()
@@ -643,6 +772,408 @@ def save_seen_deals(seen_deals):
         logging.error(f"Error saving seen deals: {e}")
         logging.error(traceback.format_exc())
         return False
+
+def load_keywords():
+    """
+    Load the keyword list from Cloud Storage.
+
+    Returns the list, or None if the file exists but cannot be used. A missing
+    file is seeded from DEFAULT_KEYWORDS. None is fatal for the run, the same as
+    an unreadable seen index: matching against the wrong list would record new
+    offers as seen without checking them against the user's real keywords, and
+    a seen offer never alerts.
+    """
+    try:
+        if not storage_client:
+            logging.error("Storage client not initialized")
+            return None
+        blob = storage_client.bucket(BUCKET_NAME).blob(KEYWORDS_FILENAME)
+        if not blob.exists():
+            logging.info(f"'{KEYWORDS_FILENAME}' does not exist; seeding it with "
+                         f"{len(DEFAULT_KEYWORDS)} default keywords")
+            save_keywords(DEFAULT_KEYWORDS)  # a failed seed is retried next run
+            return list(DEFAULT_KEYWORDS)
+
+        payload = json.loads(blob.download_as_text())
+        keywords = payload.get("keywords") if isinstance(payload, dict) else None
+        if (not isinstance(keywords, list) or not keywords
+                or not all(isinstance(k, str) and k.strip() for k in keywords)):
+            logging.error(f"'{KEYWORDS_FILENAME}' holds no usable keyword list")
+            return None
+        return keywords
+    except Exception as e:
+        logging.error(f"Error loading keywords: {e}")
+        logging.error(traceback.format_exc())
+        return None
+
+
+def save_keywords(keywords):
+    """Save the keyword list to Cloud Storage. Returns True on success."""
+    try:
+        if not storage_client:
+            return False
+        blob = storage_client.bucket(BUCKET_NAME).blob(KEYWORDS_FILENAME)
+        blob.upload_from_string(
+            json.dumps({"version": 1, "keywords": list(keywords),
+                        "updated": datetime.now(timezone.utc).isoformat()}),
+            content_type="application/json",
+        )
+        logging.info(f"Saved {len(keywords)} keywords to Cloud Storage")
+        return True
+    except Exception as e:
+        logging.error(f"Error saving keywords: {e}")
+        logging.error(traceback.format_exc())
+        return False
+
+
+_COMMAND_RE = re.compile(r"^\s*woot\s+(add|remove|delete|list|help)\b[\s:]*(.*)$",
+                         re.IGNORECASE | re.DOTALL)
+
+# Letters, digits and a little punctuation. Besides rejecting nonsense this
+# keeps line breaks and control characters out of the logs and the reply.
+_KEYWORD_CHARS = re.compile(r"^[a-z0-9][a-z0-9 &+'.-]*$")
+
+
+def parse_keyword_command(subject):
+    """
+    Read a command from an email subject: ("add", ["lego", "switch 2"]).
+
+    Returns None for anything else, including replies and forwards ("Re: woot
+    add ..."), so ordinary mail that merely mentions Woot is never acted on.
+    """
+    match = _COMMAND_RE.match(subject or "")
+    if not match:
+        return None
+    action = match.group(1).lower()
+    if action == "delete":
+        action = "remove"
+    args = [a.strip() for a in re.split(r"[,;\r\n]", match.group(2)) if a.strip()]
+    return action, args
+
+
+def _printable(text, limit=KEYWORD_MAX_CHARS):
+    """User-supplied text made safe to echo into a log line or reply."""
+    return "".join(c for c in str(text) if c.isprintable())[:limit]
+
+
+def clean_keyword(raw):
+    """Return (keyword, None) for a usable keyword, or (None, reason) if refused."""
+    keyword = " ".join(str(raw).strip().strip("\"'").lower().split())
+    if not keyword:
+        return None, "it is empty"
+    if len(keyword) > KEYWORD_MAX_CHARS:
+        return None, f"it is longer than {KEYWORD_MAX_CHARS} characters"
+    if not _KEYWORD_CHARS.match(keyword):
+        return None, "only letters, numbers, spaces and - & + ' . are allowed"
+    if sum(c.isalnum() for c in keyword) < KEYWORD_MIN_CHARS:
+        return None, (f"it is too short; a keyword needs at least {KEYWORD_MIN_CHARS} "
+                      f"letters or numbers or it matches nearly everything")
+    return keyword, None
+
+
+def _feed_item_texts(item):
+    """Every piece of a feed item's text the pre-filter matches keywords against."""
+    for field in PREFILTER_FIELDS:
+        value = item.get(field)
+        if isinstance(value, str) and value:
+            yield field, value
+    categories = item.get("Categories")
+    if isinstance(categories, list):
+        yield "Categories", " ".join(c for c in categories if isinstance(c, str))
+
+
+def items_mentioning(term, items):
+    """
+    Feed items the pre-filter would flag for `term`.
+
+    Same fields as improved_title_contains_keywords, Categories included: a
+    keyword like "tools" is rare in titles but names a whole category, and
+    judging it on titles alone would let it flag every new Tools offer.
+    """
+    needle = normalize_text(term)
+    return [item for item in items
+            if any(needle in normalize_text(text) for _, text in _feed_item_texts(item))]
+
+
+def apply_keyword_command(action, args, keywords, feed_items):
+    """
+    Apply one command to a copy of the list.
+
+    Returns (new_keywords, report_lines); report_lines become the reply email.
+    `feed_items` is this run's catalogue, used to refuse keywords so broad they
+    would match a large share of Woot, and to show what a new keyword finds.
+    """
+    updated = list(keywords)
+    lines = []
+
+    if action == "add":
+        if not args:
+            lines.append('Nothing to add. Put the keyword after "woot add".')
+        for raw in args:
+            keyword, problem = clean_keyword(raw)
+            if problem:
+                lines.append(f'Not added "{_printable(raw)}": {problem}.')
+                continue
+            if normalize_text(keyword) in {normalize_text(k) for k in updated}:
+                lines.append(f"Already on the list: {keyword}")
+                continue
+            if len(updated) >= MAX_KEYWORDS:
+                lines.append(f'Not added "{keyword}": the list is full ({MAX_KEYWORDS} '
+                             f'keywords). Remove one first.')
+                continue
+            live = items_mentioning(keyword, feed_items)
+            if feed_items and len(live) > MAX_KEYWORD_MATCH_RATIO * len(feed_items):
+                lines.append(f'Not added "{keyword}": it matches {len(live)} of the '
+                             f'{len(feed_items)} offers on Woot right now, which is too '
+                             f'broad to alert on. Try something more specific.')
+                continue
+            updated.append(keyword)
+            lines.append(f"Added: {keyword}")
+            if live:
+                lines.append(f"  {len(live)} offers on Woot match it right now. They were "
+                             f"already seen, so they will not alert; only new listings will:")
+                lines += [f"  - {i.get('Title') or '(no title)'}  {i.get('Url') or ''}".rstrip()
+                          for i in live[:10]]
+                if len(live) > 10:
+                    lines.append(f"  ...and {len(live) - 10} more")
+            else:
+                lines.append("  Nothing on Woot matches it right now.")
+
+    elif action == "remove":
+        if not args:
+            lines.append('Nothing to remove. Put the keyword after "woot remove".')
+        for raw in args:
+            target = normalize_text(" ".join(raw.strip().strip("\"'").split()))
+            found = [k for k in updated if normalize_text(k) == target]
+            if not found:
+                lines.append(f'Not on the list: "{_printable(raw)}"')
+                continue
+            if len(updated) == 1:
+                lines.append(f'Not removed "{found[0]}": it is the last keyword, and an '
+                             f'empty list would silently match nothing.')
+                continue
+            updated.remove(found[0])
+            lines.append(f"Removed: {found[0]}")
+
+    elif action == "list":
+        lines.append("No changes.")
+
+    else:  # help
+        lines.append("No changes.")
+
+    return updated, lines
+
+
+def _gmail_dmarc_pass(raw_headers, sender):
+    """
+    Whether Gmail itself verified that `sender` really sent this message.
+
+    Gmail prepends its own Authentication-Results header on arrival, so the
+    topmost one is Gmail's verdict; any a sender wrote themselves sits below it.
+
+    Even Gmail's header carries sender-chosen text: the envelope address is
+    copied into the SPF comment and smtp.mailfrom, so a MAIL FROM of
+    <dmarc=pass@evil.example> would satisfy a plain substring search. The
+    verdict is therefore parsed, not searched: quoted strings and comments go
+    first, then exactly one clause may start with "dmarc=", and it must be
+    "dmarc=pass header.from=<sender's domain>". The raw header is used
+    (compat32) so no encoded-word decoding can introduce text either.
+    """
+    msg = message_from_bytes(raw_headers or b"", policy=email_policy.compat32)
+    results = msg.get_all("Authentication-Results") or []
+    if not results:
+        return False
+    verdict = " ".join(str(results[0]).split())
+    verdict = re.sub(r'"(?:[^"\\]|\\.)*"', '""', verdict)
+    previous = None
+    while previous != verdict:  # comments may nest
+        previous, verdict = verdict, re.sub(r"\([^()]*\)", " ", verdict)
+    authserv, *clauses = [c.strip().lower() for c in verdict.split(";")]
+    if authserv != "mx.google.com":
+        return False
+    dmarc = [c.split() for c in clauses if c.startswith("dmarc=")]
+    if len(dmarc) != 1:
+        return False
+    domain = sender.rsplit("@", 1)[-1]
+    return dmarc[0][0] == "dmarc=pass" and f"header.from={domain}" in dmarc[0][1:]
+
+
+def canonical_address(address):
+    """
+    An address in the form Gmail delivers to.
+
+    Gmail ignores dots and anything after "+" in the local part, and rewrites
+    the From header of mail this account sends: mail sent as
+    "firstlast@gmail.com" can arrive From "first.last@gmail.com". Both are the
+    same mailbox, and nobody else can own either spelling.
+    """
+    local, _, domain = str(address).strip().lower().rpartition("@")
+    if domain in ("gmail.com", "googlemail.com"):
+        local, domain = local.split("+", 1)[0].replace(".", ""), "gmail.com"
+    return f"{local}@{domain}" if local and domain else ""
+
+
+# Gmail system labels arrive as \Sent, or quoted as "\\Sent".
+_SENT_LABEL = re.compile(rb'(?:^|[\s(])"?\\{1,2}Sent"?(?=[\s)])')
+
+
+def verified_command_sender(msg, labels, raw_headers):
+    """
+    The sender of a command email if it provably came from an allowed address,
+    else None.
+
+    The From header is trivially forged, so it is never trusted alone. A
+    stranger who could command the tracker could empty the keyword list and
+    the user would quietly stop getting alerts.
+    - From the tracker's own account: Gmail must have filed the message under
+      \\Sent, which only happens to mail this account actually sent. An outside
+      message claiming this From address cannot get that label.
+    - From another address in COMMAND_SENDERS: Gmail's own
+      Authentication-Results must say dmarc=pass for that address's domain.
+    """
+    sender = canonical_address(parseaddr(str(msg.get("From", "")))[1])
+    if not sender:
+        return None
+    if GMAIL_USER and sender == canonical_address(GMAIL_USER):
+        return sender if _SENT_LABEL.search(labels or b"") else None
+    allowed = {canonical_address(a) for a in COMMAND_SENDERS.split(",") if a.strip()}
+    if sender in allowed and _gmail_dmarc_pass(raw_headers, sender):
+        return sender
+    return None
+
+
+def _send_keyword_reply(to, lines, keywords):
+    """Tell the sender what their command did. Best effort."""
+    body = "\n".join(
+        lines + ["", f"Keyword list ({len(keywords)}):"] + [f"  {k}" for k in keywords]
+        + [""] + KEYWORD_COMMAND_HELP)
+    # The subject must not look like a command, or a reply to the tracker's own
+    # address would be read back in as one.
+    msg = MIMEText(body, "plain")
+    msg["Subject"] = "Woot keywords"
+    msg["From"] = GMAIL_USER
+    msg["To"] = to
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=IMAP_TIMEOUT,
+                              context=ssl.create_default_context()) as server:
+            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        logging.error(f"Could not send keyword reply: {e}")
+        return False
+
+
+def _imap_ok(response, what):
+    typ, data = response
+    if typ != "OK":
+        raise RuntimeError(f"IMAP {what} failed: {typ} {data!r}"[:300])
+    return data
+
+
+def _process_mailbox(imap, feed_items):
+    """Apply pending commands in an open IMAP session. Returns how many were applied."""
+    imap.create(COMMAND_LABEL)  # Gmail makes it a label; answers NO once it exists
+    _imap_ok(imap.select("INBOX"), "select")
+
+    # Gmail's own search narrows this to likely commands. It is only a first
+    # pass; parse_keyword_command decides, and anything it rejects is left
+    # completely untouched -- this is a personal inbox.
+    query = (f"subject:(woot (add OR remove OR delete OR list OR help)) "
+             f"newer_than:{COMMAND_LOOKBACK_DAYS}d -label:{COMMAND_LABEL}")
+    data = _imap_ok(imap.uid("SEARCH", "X-GM-RAW", f'"{query}"'), "search")
+    uids = (data[0] or b"").split() if data else []
+
+    keywords = list(_keywords)
+    applied = 0
+    # Oldest first, so commands apply in the order they were sent.
+    for uid in uids[:MAX_COMMAND_CANDIDATES]:
+        if applied >= MAX_COMMANDS_PER_RUN:
+            logging.info("More keyword commands are waiting; they will be handled next run")
+            break
+        if budget_remaining() < COMMANDS_BUDGET_RESERVE:
+            logging.warning("Run budget is short; remaining keyword commands wait for next run")
+            break
+
+        # Headers only. Message bodies are never downloaded.
+        fetched = _imap_ok(imap.uid("FETCH", uid, "(BODY.PEEK[HEADER])"), "fetch")
+        raw = next((part[1] for part in fetched if isinstance(part, tuple)), None)
+        if not raw:
+            continue
+        msg = message_from_bytes(raw, policy=email_policy.default)
+        command = parse_keyword_command(str(msg.get("Subject", "")))
+        if command is None:
+            continue
+
+        labels = _imap_ok(imap.uid("FETCH", uid, "(X-GM-LABELS)"), "label fetch")
+        label_bytes = b" ".join(p if isinstance(p, bytes) else p[0] for p in labels if p)
+        sender = verified_command_sender(msg, label_bytes, raw)
+        if sender is None:
+            # The address is the sender's own text. Reduced to plain address
+            # characters it cannot forge a WOOT_HEALTH line for the monitoring
+            # metric to count.
+            claimed = re.sub(r"[^A-Za-z0-9@._+-]", "_",
+                             parseaddr(str(msg.get("From", "")))[1])[:80]
+            logging.warning(f"Ignored a keyword command from unverified sender {claimed}")
+            record_health_event("keyword_command_rejected",
+                                f"ignored a command from unverified sender {claimed}")
+            # Labelled anyway so it is not re-examined every run. No reply:
+            # answering unverified mail would let anyone make this account
+            # send email to an address of their choosing.
+            imap.uid("STORE", uid, "+X-GM-LABELS", f"({COMMAND_LABEL})")
+            continue
+
+        action, args = command
+        updated, lines = apply_keyword_command(action, args, keywords, feed_items)
+        if updated != keywords:
+            if not save_keywords(updated):
+                # Leave the email unlabelled so the next run applies it again.
+                raise RuntimeError("could not save the keyword list")
+            keywords = updated
+            set_keywords(keywords)
+        logging.info(f"Keyword command '{action}' with {len(args)} argument(s) applied; "
+                     f"the list now holds {len(keywords)} keywords")
+
+        _send_keyword_reply(sender, lines, keywords)
+        # Labelled last. If this fails the command is re-applied next run, which
+        # is harmless: adding or removing the same keyword twice changes nothing.
+        _imap_ok(imap.uid("STORE", uid, "+X-GM-LABELS", f"({COMMAND_LABEL})"), "label")
+        applied += 1
+
+    return applied
+
+
+def process_keyword_commands(feed_items):
+    """
+    Apply keyword commands emailed to the tracker. Returns how many were applied.
+
+    Never raises: an unreachable inbox is recorded as a notable event and the
+    run carries on with the list it already has. Deal alerts must not depend on
+    this.
+    """
+    if not (GMAIL_USER and GMAIL_APP_PASSWORD):
+        return 0
+    if budget_remaining() < COMMANDS_BUDGET_RESERVE:
+        logging.warning("Run budget is short; keyword commands wait for next run")
+        return 0
+    imap = None
+    try:
+        imap = imaplib.IMAP4_SSL(IMAP_HOST, timeout=IMAP_TIMEOUT,
+                                 ssl_context=ssl.create_default_context())
+        imap.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        return _process_mailbox(imap, feed_items)
+    except Exception as e:
+        logging.error(f"Could not process keyword commands: {e}")
+        logging.error(traceback.format_exc())
+        record_health_event("keyword_commands_failed", repr(e))
+        return 0
+    finally:
+        if imap is not None:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+
 
 def event_pages(kind):
     """Whether an event kind should escalate the run and alert the user."""
@@ -766,7 +1297,7 @@ def send_alert(subject, body):
         email['To'] = GMAIL_USER
         email.attach(MIMEText(body, 'plain'))
 
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=ssl.create_default_context()) as server:
             server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
             server.send_message(sms)
             server.send_message(email)
@@ -1518,11 +2049,208 @@ def fetch_detailed_offers(offer_ids):
     )
     return all_detailed_offers, fetched_ids
 
+def _plain_text(value, limit):
+    """HTML-stripped, whitespace-collapsed text, cut to `limit` characters."""
+    if isinstance(value, list):
+        value = " ".join(str(v) for v in value if v)
+    if not isinstance(value, str):
+        return ""
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", value)).strip()
+    return text[:limit]
+
+
+def _jev_products_for(deal):
+    """
+    The Jev product descriptions for the keywords this deal matched.
+
+    None means "do not judge it": either a matched keyword has no tested
+    description (Montessori, or anything added by email), or nothing matched.
+    Such a deal is always texted -- one keyword Jev cannot judge is enough to
+    vouch for it.
+    """
+    keywords = set()
+    for field in DEAL_MATCH_FIELDS:
+        keywords.update(matched_keywords(deal.get(field)))
+    products = {JEV_KEYWORD_PRODUCT.get(normalize_text(k)) for k in keywords}
+    if not keywords or None in products:
+        return None
+    return sorted(products)
+
+
+def _jev_questions(products):
+    """
+    The questions Jev is asked, per product. Only `wanted` decides anything, but
+    all three are asked because that is the exact request the threshold was
+    measured with; the accessory score also explains a drop in the email.
+    """
+    questions = {}
+    for product in products:
+        wanted = JEV_PRODUCTS[product]
+        questions[f"wanted__{product}"] = {
+            "type": "noul",
+            "instructions": {
+                "wanted_product": wanted,
+                "question": "Is `listing` selling `wanted_product` itself, or a "
+                            "bundle that includes it?",
+            },
+            "criteria": {
+                "true": "The listing sells the product described in "
+                        "`wanted_product`, on its own or with extras included.",
+                "false": "The listing sells something else: an accessory or part "
+                         "for that product sold without it, or an unrelated product "
+                         "whose name only resembles it.",
+            },
+        }
+        questions[f"accessory__{product}"] = {
+            "type": "noul",
+            "instructions": {
+                "wanted_product": wanted,
+                "question": "Is `listing` an accessory, consumable or part for "
+                            f"`wanted_product` ({JEV_ACCESSORY_EXAMPLES}), sold "
+                            "without the product itself?",
+            },
+        }
+        questions[f"unrelated__{product}"] = {
+            "type": "noul",
+            "instructions": {
+                "wanted_product": wanted,
+                "question": "Is `listing` for a product that has nothing to do with "
+                            "`wanted_product`, being neither that product nor an "
+                            "accessory for it?",
+            },
+        }
+    return questions
+
+
+def _jev_state(deal, feed_item):
+    """What Jev sees of the offer. Categories only exist on the feed's copy."""
+    listing = {"title": deal.get("Title") or (feed_item or {}).get("Title") or ""}
+    if isinstance(deal.get("Subtitle"), str) and deal["Subtitle"].strip():
+        listing["subtitle"] = deal["Subtitle"]
+    categories = (feed_item or {}).get("Categories") or deal.get("Categories")
+    if isinstance(categories, list):
+        categories = [c for c in categories if isinstance(c, str)]
+        if categories:
+            listing["categories"] = categories
+    for field, key in (("Features", "features"), ("WriteUpBody", "writeup")):
+        text = _plain_text(deal.get(field), JEV_DETAIL_CHARS)
+        if text:
+            listing[key] = text
+    return {"listing": listing}
+
+
+def _jev_scores(state, products):
+    """
+    Ask Jev about one offer. Returns {product: {"wanted": p, "accessory": p}}.
+
+    Raises on any failure; the caller keeps the deal. 429 and 529 (overloaded)
+    are retried with backoff, as TypeSafe's API docs ask.
+    """
+    delay = 1.0
+    for attempt in range(1, JEV_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.request(
+                "POST", JEV_ENDPOINT,
+                headers={"Authorization": f"Bearer {TYPESAFE_API_KEY}"},
+                json={"state": state, "model": JEV_MODEL,
+                      "questions": _jev_questions(products)},
+                timeout=JEV_TIMEOUT,
+            )
+            problem = None if response.status_code == 200 else \
+                f"HTTP {response.status_code}: {response.text[:200]}"
+            retryable = response.status_code in (429, 500, 502, 503, 504, 529)
+        except requests.RequestException as e:
+            problem, retryable = type(e).__name__, True
+        if problem is None:
+            break
+        if (not retryable or attempt == JEV_MAX_ATTEMPTS
+                or budget_remaining() < delay + JEV_TIMEOUT + 20):
+            raise RuntimeError(f"Jev request failed: {problem}")
+        time.sleep(delay)
+        delay *= 2
+
+    answers = response.json().get("answers") or {}
+    scores = {}
+    for product in products:
+        pair = {q: float(answers[f"{q}__{product}"]["noul"]) for q in ("wanted", "accessory")}
+        if not all(0.0 <= p <= 1.0 for p in pair.values()):  # also rejects NaN
+            raise ValueError(f"Jev returned an out-of-range score for {product}: {pair}")
+        scores[product] = pair
+    return scores
+
+
+def screen_matches(deals, feed_items):
+    """
+    Split confirmed matches into (to_text, filtered_out) using Jev.
+
+    filtered_out holds (deal, wanted_score, accessory_score) for offers Jev is
+    confident are not the product -- an accessory, or a word that only contains
+    a keyword. They are still emailed, never silently dropped.
+
+    Fails open everywhere: with no API key, on any error or timeout, once the
+    run budget is short, or for a keyword Jev has no tested description for,
+    the deal is texted exactly as it would have been without this filter.
+    """
+    if not TYPESAFE_API_KEY or not deals:
+        return list(deals), []
+
+    feed_by_id = {str(i.get("OfferId") or i.get("Id")): i for i in feed_items}
+    to_text, filtered, failures = [], [], 0
+    for deal in deals:
+        deal_id = str(deal.get("Id") or deal.get("OfferId") or "unknown")
+        products = _jev_products_for(deal)
+        if products is None:
+            to_text.append(deal)
+            continue
+        if budget_remaining() < JEV_TIMEOUT + 20:
+            logging.warning(f"Run budget too short to ask Jev about {deal_id}; texting it")
+            to_text.append(deal)
+            continue
+        try:
+            scores = _jev_scores(_jev_state(deal, feed_by_id.get(deal_id)), products)
+        except Exception as e:
+            failures += 1
+            logging.warning(f"Jev could not judge {deal_id}, texting it: {e}")
+            to_text.append(deal)
+            continue
+
+        best = max(s["wanted"] for s in scores.values())
+        logging.info(f"Jev scored {deal_id} {scores}")
+        # Dropped only when EVERY product it matched says no, so a bundle of
+        # two tracked things survives if either one is really in it.
+        if best < JEV_DROP_BELOW:
+            accessory = max(s["accessory"] for s in scores.values())
+            filtered.append((deal, best, accessory))
+        else:
+            to_text.append(deal)
+
+    if failures:
+        record_health_event("jev_unavailable",
+                            f"Jev could not judge {failures} of {len(deals)} matches; "
+                            f"they were texted unfiltered")
+    return to_text, filtered
+
+
+DEAL_MATCH_FIELDS = ("Title", "Subtitle", "WriteUpBody", "Features", "Snippet", "Slug")
+
+# Feed-item fields the pre-filter reads, plus Categories. In practice the live
+# feed fills only Title and Categories (Slug and Subtitle were null on all
+# 11,097 items on 2026-09-27); the rest are kept in case the feed changes.
+# Slug would carry the product name even when Title is generic; normalize_text
+# flattens its hyphens so multi-word keywords still match.
+PREFILTER_FIELDS = (
+    "Title", "title", "Description", "description", "Subtitle", "subtitle",
+    "Snippet", "snippet", "Summary", "summary", "Name", "name",
+    "ProductName", "productName", "WriteUpBody", "writeUpBody",
+    "Features", "features", "Slug", "slug",
+)
+
+
 def is_matching_deal(deal):
     """Check whether a detailed offer matches our keywords."""
     deal_id = deal.get("Id", deal.get("OfferId", "unknown"))
 
-    for field in ("Title", "Subtitle", "WriteUpBody", "Features", "Snippet", "Slug"):
+    for field in DEAL_MATCH_FIELDS:
         hits = matched_keywords(deal.get(field))
         if hits:
             logging.info(f"Deal {deal_id} matches {hits} in field '{field}'")
@@ -1621,13 +2349,21 @@ def format_deal_notifications(deal):
     logging.info(f"Notifications formatted for deal {deal_id}")
     return title, email_body, text_message
 
-def send_notifications(deals):
-    """Send email and text notifications for new deals. Returns True on success."""
-    if not deals:
+def send_notifications(deals, filtered=()):
+    """
+    Send the alert text and email for new deals. Returns True on success.
+
+    `filtered` holds (deal, wanted_score, accessory_score) for matches Jev ruled
+    out. They are listed at the end of the email so nothing disappears
+    unseen, but never texted: a text about a Kindle case is the noise the
+    filter exists to remove. With only filtered matches, just the email goes.
+    """
+    if not deals and not filtered:
         logging.info("No deals to send notifications for. Skipping.")
         return False
 
-    logging.info(f"Preparing to send notifications for {len(deals)} deals")
+    logging.info(f"Preparing to send notifications for {len(deals)} deals "
+                 f"and {len(filtered)} filtered-out matches")
     try:
         # Send text messages to the phone number
         text_msg = MIMEMultipart('alternative')
@@ -1660,9 +2396,27 @@ def send_notifications(deals):
             html_parts.append(html_content)
             formatted += 1
 
-        if not formatted:
+        if deals and not formatted:
             logging.error("No deals could be formatted; nothing to send")
             return False
+
+        if filtered:
+            text_parts.append(
+                "Filtered out as accessories or look-alikes (not texted):\n" + "\n".join(
+                    f"  {d.get('Title') or 'No Title'} - {d.get('Url') or 'No URL'} "
+                    f"(is the product: {w:.2f}, accessory: {a:.2f})"
+                    for d, w, a in filtered))
+            html_parts.append(
+                "<h3>Filtered out as accessories or look-alikes (not texted)</h3><ul>"
+                + "".join(
+                    f'<li><a href="{html.escape(d.get("Url") or "", quote=True)}">'
+                    f'{html.escape(d.get("Title") or "No Title")}</a> '
+                    f"(is the product: {w:.2f}, accessory: {a:.2f})</li>"
+                    for d, w, a in filtered)
+                + "</ul>")
+            if not deals:
+                email_msg.replace_header(
+                    "Subject", f"Woot: {len(filtered)} match(es) filtered out, nothing texted")
 
         # For SMS - use a simple summary format instead of listing each deal.
         # Go through matched_keywords() so a field that is present but null does
@@ -1690,12 +2444,13 @@ def send_notifications(deals):
         email_msg.attach(MIMEText(html_content, 'html'))
 
         # Send both messages
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=ssl.create_default_context()) as server:
             server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
 
             # Send text message first
-            server.send_message(text_msg)
-            logging.info("Text message sent successfully")
+            if formatted:
+                server.send_message(text_msg)
+                logging.info("Text message sent successfully")
 
             # Send detailed email
             server.send_message(email_msg)
@@ -1741,34 +2496,11 @@ def improved_title_contains_keywords(item):
     if not isinstance(item, dict):
         return False
 
-    fields_to_check = [
-        "Title", "title",
-        "Description", "description",
-        "Subtitle", "subtitle",
-        "Snippet", "snippet",
-        "Summary", "summary",
-        "Name", "name",
-        "ProductName", "productName",
-        "WriteUpBody", "writeUpBody",
-        "Features", "features",
-        # Slug carries the product name even when Title is generic; normalize_text
-        # flattens its hyphens so multi-word keywords still match.
-        "Slug", "slug",
-    ]
-
-    for field in fields_to_check:
-        hits = matched_keywords(item.get(field))
+    for field, text in _feed_item_texts(item):
+        hits = matched_keywords(text)
         if hits:
             item_id = item.get("OfferId", item.get("Id", "unknown"))
             logging.info(f"Pre-filter hit on {item_id}: {hits} in field '{field}'")
-            return True
-
-    categories = item.get("Categories")
-    if isinstance(categories, list):
-        hits = matched_keywords(" ".join(c for c in categories if isinstance(c, str)))
-        if hits:
-            item_id = item.get("OfferId", item.get("Id", "unknown"))
-            logging.info(f"Pre-filter hit on {item_id}: {hits} in Categories")
             return True
 
     return False
@@ -1851,6 +2583,16 @@ def _run_deal_check():
         report_run_health("failed", metrics)
         return "Error: could not read seen-deals state", 503
 
+    # Same reasoning: a run that matched against the wrong keywords would mark
+    # every new offer seen without checking it against the user's real list.
+    keywords = load_keywords()
+    if keywords is None:
+        record_health_event("keywords_unreadable",
+                            f"could not read {KEYWORDS_FILENAME} from {BUCKET_NAME}")
+        report_run_health("failed", metrics)
+        return "Error: could not read the keyword list", 503
+    set_keywords(keywords)
+
     # Step 1: fetch the feed
     global _feed_was_fetched
     feed_items, feed_complete = fetch_feed()
@@ -1868,6 +2610,12 @@ def _run_deal_check():
         # more of the rate-limit budget. The health report is the alert path.
         record_health_event("feed_incomplete",
                             f"only {len(feed_items)} items read before the feed was cut short")
+
+    # Emailed keyword changes are applied before matching, so a keyword added
+    # this run already catches new offers this run. Needs the catalogue in hand
+    # to refuse keywords that would match a large share of it.
+    metrics["commands"] = process_keyword_commands(feed_items)
+    metrics["keywords"] = len(_keywords)
 
     # Step 2: pre-filter on the feed's own text fields so getoffers calls are only
     # spent on plausible matches.
@@ -1920,11 +2668,17 @@ def _run_deal_check():
 
     metrics["matches"] = len(matching_deals)
 
+    # Step 3b: have Jev set aside accessories and look-alikes. They are still
+    # emailed, and still recorded as seen below, exactly like texted deals.
+    to_text, filtered_out = screen_matches(matching_deals, feed_items)
+    metrics["jev_filtered"] = len(filtered_out)
+
     # Step 4: notify
     notified = False
     if matching_deals:
-        logging.info(f"Found {len(matching_deals)} new matching deals. Sending notifications.")
-        notified = send_notifications(matching_deals)
+        logging.info(f"Found {len(matching_deals)} new matching deals "
+                     f"({len(filtered_out)} filtered out). Sending notifications.")
+        notified = send_notifications(to_text, filtered_out)
         if not notified:
             record_health_event(
                 "notification_failed",
@@ -2153,6 +2907,8 @@ def count_canary_hits(items):
     """
     if not CANARY_KEYWORD:
         return 0
+    # Title, Subtitle and Slug only, as it always has been: widening the fields
+    # would move the counts this observation period is collecting.
     needle = normalize_text(CANARY_KEYWORD)
     hits = 0
     for item in items:
@@ -2219,7 +2975,7 @@ def test_woot_api_structure():
                                 # Log which keywords were found and in which fields
                                 for field in item.keys():
                                     if isinstance(item[field], str):
-                                        for keyword in KEYWORDS:
+                                        for keyword in _keywords:
                                             if keyword.lower() in item[field].lower():
                                                 preview = item[field][:50] + "..." if len(item[field]) > 50 else item[field]
                                                 logging.info(f"Keyword '{keyword}' found in field '{field}': {preview}")
@@ -2250,7 +3006,7 @@ def test_woot_api_structure():
                             # Log which keywords were found and in which fields
                             for field in item.keys():
                                 if isinstance(item[field], str):
-                                    for keyword in KEYWORDS:
+                                    for keyword in _keywords:
                                         if keyword.lower() in item[field].lower():
                                             preview = item[field][:50] + "..." if len(item[field]) > 50 else item[field]
                                             logging.info(f"Keyword '{keyword}' found in field '{field}': '{preview}'")

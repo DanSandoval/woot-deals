@@ -214,6 +214,86 @@ class FakeStorageClient:
         return FakeBucket(self.store)
 
 
+GMAIL_DMARC_PASS = ("mx.google.com; dkim=pass header.i=@gmail.com; spf=pass "
+                    "smtp.mailfrom=me@gmail.com; dmarc=pass (p=NONE sp=QUARANTINE "
+                    "dis=NONE) header.from=gmail.com")
+
+
+class FakeGmail:
+    """The tracker's Gmail inbox, as far as keyword commands touch it over IMAP."""
+
+    def __init__(self):
+        self.messages = {}  # uid -> {"raw": header bytes, "labels": set}
+        self.next_uid = 1
+        self.fail_login = False
+
+    def add(self, subject, sender=None, sent=True, auth_results=()):
+        """
+        Deliver a message. `sent` marks it as sent BY this account (Gmail's
+        \\Sent label), which a message from anyone else can never carry.
+        """
+        lines = [f"Authentication-Results: {a}" for a in auth_results]
+        lines += [f"From: {sender or main.GMAIL_USER}", f"To: {main.GMAIL_USER}",
+                  f"Subject: {subject}", "Message-ID: <m@example.com>"]
+        uid = self.next_uid
+        self.next_uid += 1
+        self.messages[uid] = {"raw": ("\r\n".join(lines) + "\r\n\r\n").encode(),
+                              "labels": {"\\Sent"} if sent else set()}
+        return uid
+
+    def processed(self, uid):
+        return main.COMMAND_LABEL in self.messages[uid]["labels"]
+
+    def connect(self, host, port=993, timeout=None, ssl_context=None):
+        self.connect_kwargs = {"timeout": timeout, "ssl_context": ssl_context}
+        return FakeImapSession(self)
+
+
+class FakeImapSession:
+    def __init__(self, gmail):
+        self.gmail = gmail
+
+    def login(self, user, password):
+        if self.gmail.fail_login:
+            raise main.imaplib.IMAP4.error("[AUTHENTICATIONFAILED] Invalid credentials")
+        return "OK", [b"authenticated"]
+
+    def create(self, name):
+        return "NO", [b"[ALREADYEXISTS] Duplicate folder name"]
+
+    def select(self, mailbox):
+        return "OK", [str(len(self.gmail.messages)).encode()]
+
+    def logout(self):
+        return "BYE", [b"logging out"]
+
+    def uid(self, command, *args):
+        if command == "SEARCH":
+            # Ignores the Gmail query on purpose: whatever the search lets
+            # through, the tracker itself must still refuse non-commands.
+            pending = [u for u, m in sorted(self.gmail.messages.items())
+                       if main.COMMAND_LABEL not in m["labels"]]
+            return "OK", [b" ".join(str(u).encode() for u in pending)]
+        uid = int(args[0])
+        msg = self.gmail.messages[uid]
+        # Strict on purpose. Anything else could change the owner's mail:
+        # BODY[...] or RFC822 would mark it read and download the body, and
+        # X-GM-LABELS without "+" would replace its labels, archiving it.
+        if command == "FETCH" and args[1] == "(X-GM-LABELS)":
+            # Gmail quotes system labels with an escaped backslash: ("\\Sent").
+            labels = b" ".join(
+                (b'"\\\\' + l[1:].encode() + b'"') if l.startswith("\\") else l.encode()
+                for l in sorted(msg["labels"]))
+            return "OK", [f"{uid} (X-GM-LABELS (".encode() + labels + f") UID {uid})".encode()]
+        if command == "FETCH" and args[1] == "(BODY.PEEK[HEADER])":
+            head = f"{uid} (UID {uid} BODY[HEADER] {{{len(msg['raw'])}}}".encode()
+            return "OK", [(head, msg["raw"]), b")"]
+        if command == "STORE" and args[1] == "+X-GM-LABELS":
+            msg["labels"].add(args[2].strip("()"))
+            return "OK", [b""]
+        raise AssertionError(f"IMAP {command} {args[1:]} would alter the owner's mailbox")
+
+
 class PipelineTestBase(unittest.TestCase):
     """Shared fakes: Woot API with its rate limit, Cloud Storage, and the alert channel."""
 
@@ -222,6 +302,9 @@ class PipelineTestBase(unittest.TestCase):
         self.store = {}
         self.sent = []
         self.alerts = []
+        self.gmail = FakeGmail()
+        self.replies = []
+        self.filtered = []
 
         main._last_request_time = 0.0
         main._run_deadline = None
@@ -240,13 +323,34 @@ class PipelineTestBase(unittest.TestCase):
             mock.patch.object(main, "storage_client", FakeStorageClient(self.store)),
             mock.patch.object(main, "send_notifications", self._send),
             mock.patch.object(main, "send_alert", self._alert),
+            # Every run checks the inbox for keyword commands. Default to an
+            # empty one, and capture the replies, so no test touches the network.
+            mock.patch.object(main.imaplib, "IMAP4_SSL", self.gmail.connect),
+            mock.patch.object(main.smtplib, "SMTP_SSL", self._smtp),
+            # A developer machine may have a TypeSafe key in its environment;
+            # screening is switched on only by the tests that exercise it.
+            mock.patch.object(main, "TYPESAFE_API_KEY", None),
         ]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
 
-    def _send(self, deals):
+        # A run replaces the live list with the bucket's copy; start every test
+        # from the defaults and put them back afterwards.
+        main.set_keywords(main.DEFAULT_KEYWORDS)
+        self.addCleanup(main.set_keywords, main.DEFAULT_KEYWORDS)
+
+    def _smtp(self, *args, **kwargs):
+        self.smtp_kwargs = kwargs
+        server = mock.MagicMock()
+        server.__enter__ = mock.Mock(return_value=server)
+        server.__exit__ = mock.Mock(return_value=False)
+        server.send_message.side_effect = self.replies.append
+        return server
+
+    def _send(self, deals, filtered=()):
         self.sent.append(list(deals))
+        self.filtered.append(list(filtered))
         return True
 
     def _alert(self, subject, body):
@@ -347,12 +451,31 @@ class PipelineTest(PipelineTestBase):
         self.assertEqual(main.matched_keywords("FlashForge 3-D Printer"),
                          ["3-d printer"])
 
-    def test_mac_mini_and_3d_printer_keywords_do_not_match_unrelated_offers(self):
-        for title in ["Apple MacBook Air 13-inch",
+    def test_montessori_toy_spellings_all_match(self):
+        for title in ["Montessori Busy Board for Toddlers",
+                      "Montessori Toys for 1 Year Old, 6-Pack",
+                      "Wooden Montessori-Style Stacking Rings",
+                      "montessori-wooden-sensory-board"]:
+            with self.subTest(title=title):
+                self.assertEqual(main.matched_keywords(title), ["montessori"])
+
+    def test_mac_laptop_and_studio_keywords_match(self):
+        for title, keyword in [("Apple MacBook Air 13-inch M2", "macbook air"),
+                               ("apple-macbook-air-15-m3-8gb", "macbook air"),
+                               ("Apple MacBook Pro 14-inch M3 Pro", "macbook pro"),
+                               ("Apple MacBook-Pro 16 (Refurbished)", "macbook pro"),
+                               ("Apple Mac Studio M2 Max 32GB", "mac studio")]:
+            with self.subTest(title=title):
+                self.assertEqual(main.matched_keywords(title), [keyword])
+
+    def test_new_keywords_do_not_match_unrelated_offers(self):
+        for title in ["Apple Studio Display 27-inch",
                       "Apple iMac 24-inch M3",
                       "HP LaserJet Pro Printer",
                       "Sony 3D Blu-ray Player",
-                      "Compact Mini Fridge"]:
+                      "Compact Mini Fridge",
+                      "Wooden Toy Blocks, 100-Piece Set",
+                      "Melissa & Doug Shape Sorter"]:
             with self.subTest(title=title):
                 self.assertFalse(main.matched_keywords(title), title)
 
@@ -514,7 +637,7 @@ class PipelineTest(PipelineTestBase):
         self.assertIn("new matching deals: 0", result)
 
     def test_failed_notification_leaves_deals_unseen_for_retry(self):
-        with mock.patch.object(main, "send_notifications", lambda deals: False):
+        with mock.patch.object(main, "send_notifications", lambda deals, filtered=(): False):
             self.run_check()
 
         seen = json.loads(self.store[main.SEEN_DEALS_FILENAME])["deals"]
@@ -831,14 +954,14 @@ class HealthAlertingTest(PipelineTestBase):
         self.assertIs(main.save_seen_deals, original)
 
     def test_failed_notification_is_reported(self):
-        with mock.patch.object(main, "send_notifications", lambda deals: False):
+        with mock.patch.object(main, "send_notifications", lambda deals, filtered=(): False):
             body, _ = self.run_check()
         self.assertIn("health: degraded", body)
         self.assertTrue(any("notification_failed" in a[0] for a in self.alerts))
 
     def test_repeat_failures_do_not_alert_every_run(self):
         """A persistent problem must not text the user hourly for days."""
-        with mock.patch.object(main, "send_notifications", lambda deals: False):
+        with mock.patch.object(main, "send_notifications", lambda deals, filtered=(): False):
             self.run_check()
             first = len(self.alerts)
             for _ in range(5):
@@ -850,7 +973,7 @@ class HealthAlertingTest(PipelineTestBase):
 
     def test_cooldown_expiry_re_alerts(self):
         from datetime import datetime, timedelta, timezone
-        with mock.patch.object(main, "send_notifications", lambda deals: False):
+        with mock.patch.object(main, "send_notifications", lambda deals, filtered=(): False):
             self.run_check()
             state = self.health_state()
             stale = datetime.now(timezone.utc) - timedelta(hours=main.ALERT_COOLDOWN_HOURS + 1)
@@ -860,14 +983,14 @@ class HealthAlertingTest(PipelineTestBase):
         self.assertEqual(len(self.alerts), 2)
 
     def test_a_different_problem_alerts_immediately(self):
-        with mock.patch.object(main, "send_notifications", lambda deals: False):
+        with mock.patch.object(main, "send_notifications", lambda deals, filtered=(): False):
             self.run_check()
         with mock.patch.object(main, "save_seen_deals", lambda deals: False):
             self.run_check()
         self.assertEqual(len(self.alerts), 2, "a new kind of problem bypasses the cooldown")
 
     def test_recovery_is_announced_once(self):
-        with mock.patch.object(main, "send_notifications", lambda deals: False):
+        with mock.patch.object(main, "send_notifications", lambda deals, filtered=(): False):
             self.run_check()
         self.alerts.clear()
         self.run_check()
@@ -999,7 +1122,7 @@ class HealthAlertingTest(PipelineTestBase):
 
     def test_alerts_are_capped_per_incident(self):
         from datetime import datetime, timedelta, timezone
-        with mock.patch.object(main, "send_notifications", lambda deals: False):
+        with mock.patch.object(main, "send_notifications", lambda deals, filtered=(): False):
             for i in range(main.MAX_REPEAT_ALERTS_PER_INCIDENT + 4):
                 # Age the cooldown out each time so only the cap can stop it.
                 state = self.health_state()
@@ -1015,7 +1138,7 @@ class HealthAlertingTest(PipelineTestBase):
                              "one ongoing incident must not alert without bound")
 
     def test_alerts_are_capped_per_day(self):
-        with mock.patch.object(main, "send_notifications", lambda deals: False):
+        with mock.patch.object(main, "send_notifications", lambda deals, filtered=(): False):
             for i in range(main.MAX_ALERTS_PER_DAY + 3):
                 # Force a different signature each run so only the daily cap bites.
                 state = self.health_state()
@@ -1051,6 +1174,508 @@ class HealthAlertingTest(PipelineTestBase):
         self.assertEqual(len(self.sent), 1)
 
 
+class KeywordCommandTest(PipelineTestBase):
+    """
+    The keyword list is edited by emailing the tracker's own inbox.
+
+    That inbox is a personal Gmail account, so two things matter above all:
+    only the owner can change the list, and no other mail is ever touched.
+    """
+
+    def stored_keywords(self):
+        return json.loads(self.store[main.KEYWORDS_FILENAME])["keywords"]
+
+    def reply_text(self):
+        self.assertEqual(len(self.replies), 1, "expected exactly one reply")
+        return self.replies[0].get_payload()
+
+    def kinds(self):
+        return [e["kind"] for e in main._health_events]
+
+    # -- the list itself -----------------------------------------------------
+
+    def test_first_run_seeds_the_list_from_the_defaults(self):
+        self.run_check()
+        self.assertEqual(self.stored_keywords(), main.DEFAULT_KEYWORDS)
+
+    def test_the_stored_list_is_what_a_new_process_matches_with(self):
+        self.store[main.KEYWORDS_FILENAME] = json.dumps({"keywords": ["lego"]})
+        self.run_check()
+        self.assertEqual(main._keywords, ["lego"])
+        self.assertEqual(self.sent, [], "kindle is no longer on the list")
+
+    def test_an_unreadable_list_fails_the_run_loudly(self):
+        # Matching with the wrong list would mark offers seen unchecked, and a
+        # seen offer never alerts -- so this must stop the run, not guess.
+        self.store[main.KEYWORDS_FILENAME] = "{not json"
+        body, status = self.run_check()
+        self.assertEqual(status, 503)
+        self.assertEqual(self.sent, [])
+        self.assertTrue(any("keywords_unreadable" in a[0] for a in self.alerts))
+
+    def test_an_empty_stored_list_counts_as_unreadable(self):
+        self.store[main.KEYWORDS_FILENAME] = json.dumps({"keywords": []})
+        _, status = self.run_check()
+        self.assertEqual(status, 503)
+
+    # -- applying commands ---------------------------------------------------
+
+    def test_add_is_applied_saved_answered_and_marked_done(self):
+        uid = self.gmail.add("woot add Lego, Switch 2")
+        self.run_check()
+        self.assertIn("lego", self.stored_keywords())
+        self.assertIn("switch 2", self.stored_keywords())
+        self.assertTrue(self.gmail.processed(uid))
+        reply = self.replies[0]
+        self.assertEqual(reply["To"], main.GMAIL_USER)
+        self.assertIn("Added: lego", reply.get_payload())
+        self.assertIsNone(main.parse_keyword_command(reply["Subject"]),
+                          "a reply must never read back in as a command")
+
+    def test_a_keyword_added_now_catches_new_offers_in_the_same_run(self):
+        # First run: every offer is new. "Widget 1234" matches only the new keyword.
+        self.gmail.add("woot add widget 1234")
+        self.run_check()
+        titles = [d["Title"] for d in self.sent[0]]
+        self.assertIn("Widget 1234", titles)
+
+    def test_remove_and_the_answers_for_unknown_and_duplicate_keywords(self):
+        self.gmail.add("woot remove Kindle, nothing-like-this")
+        self.gmail.add("woot add Air Tag")  # same as "air-tag" once hyphens flatten
+        self.run_check()
+        self.assertNotIn("kindle", self.stored_keywords())
+        self.assertEqual(self.stored_keywords().count("air-tag"), 1)
+        self.assertNotIn("air tag", self.stored_keywords())
+        self.assertIn("Removed: kindle", self.replies[0].get_payload())
+        self.assertIn('Not on the list: "nothing-like-this"', self.replies[0].get_payload())
+        self.assertIn("Already on the list: air tag", self.replies[1].get_payload())
+
+    def test_commands_apply_in_the_order_they_were_sent(self):
+        self.gmail.add("woot add lego")
+        self.gmail.add("woot remove lego")
+        self.run_check()
+        self.assertNotIn("lego", self.stored_keywords())
+
+    def test_list_and_help_change_nothing_but_answer(self):
+        self.gmail.add("woot list")
+        self.run_check()
+        self.assertEqual(self.stored_keywords(), main.DEFAULT_KEYWORDS)
+        self.assertIn("kindle", self.reply_text())
+
+    def test_short_broad_and_malformed_keywords_are_refused(self):
+        self.gmail.add("woot add tv, widget, <script>")
+        self.run_check()
+        self.assertEqual(self.stored_keywords(), main.DEFAULT_KEYWORDS)
+        reply = self.reply_text()
+        self.assertIn('Not added "tv": it is too short', reply)
+        # "widget" is in every fixture title: alerting on it would text every run.
+        self.assertIn('Not added "widget": it matches', reply)
+        self.assertIn('Not added "<script>": only letters', reply)
+
+    def test_the_last_keyword_cannot_be_removed(self):
+        self.store[main.KEYWORDS_FILENAME] = json.dumps({"keywords": ["lego"]})
+        self.gmail.add("woot remove lego")
+        self.run_check()
+        self.assertEqual(self.stored_keywords(), ["lego"])
+        self.assertIn("it is the last keyword", self.reply_text())
+
+    def test_the_list_has_a_ceiling(self):
+        full = [f"thing {i:02d}" for i in range(main.MAX_KEYWORDS)]
+        self.store[main.KEYWORDS_FILENAME] = json.dumps({"keywords": full})
+        self.gmail.add("woot add lego")
+        self.run_check()
+        self.assertNotIn("lego", self.stored_keywords())
+        self.assertIn("the list is full", self.reply_text())
+
+    # -- who may send commands -----------------------------------------------
+
+    def test_gmail_dot_spelling_of_the_owner_still_counts_as_the_owner(self):
+        # Gmail rewrites From on mail this account sends, adding the dots of
+        # the account's display spelling. Seen on the real inbox, 2026-09-27.
+        with mock.patch.object(main, "GMAIL_USER", "firstlast@gmail.com"):
+            uid = self.gmail.add("woot add lego", sender="first.last@gmail.com")
+            self.run_check()
+        self.assertIn("lego", self.stored_keywords())
+        self.assertTrue(self.gmail.processed(uid))
+
+    def test_mail_forging_the_owners_address_is_ignored(self):
+        # Same From as the owner, but it arrived from outside: no \Sent label.
+        uid = self.gmail.add("woot remove kindle", sent=False)
+        body, status = self.run_check()
+        self.assertIn("kindle", self.stored_keywords())
+        self.assertEqual(self.replies, [], "never answer unverified mail")
+        self.assertTrue(self.gmail.processed(uid), "so it is not re-examined every run")
+        self.assertIn("keyword_command_rejected", self.kinds())
+        self.assertIn("health: ok", body, "an ignored forgery is not an outage")
+
+    def test_another_allowed_address_needs_gmails_own_dmarc_pass(self):
+        with mock.patch.object(main, "COMMAND_SENDERS", "Me@gmail.com"):
+            self.gmail.add("woot add lego", sender="me@gmail.com", sent=False,
+                           auth_results=[GMAIL_DMARC_PASS])
+            self.run_check()
+        self.assertIn("lego", self.stored_keywords())
+        self.assertEqual(self.replies[0]["To"], "me@gmail.com")
+
+    def test_a_forged_verdict_below_gmails_real_one_is_ignored(self):
+        # Gmail prepends its own verdict; the sender's fake one sits underneath.
+        with mock.patch.object(main, "COMMAND_SENDERS", "me@gmail.com"):
+            self.gmail.add("woot add lego", sender="me@gmail.com", sent=False,
+                           auth_results=["mx.google.com; dmarc=fail (p=NONE) header.from=gmail.com",
+                                         GMAIL_DMARC_PASS])
+            self.run_check()
+        self.assertNotIn("lego", self.stored_keywords())
+        self.assertEqual(self.replies, [])
+
+    def test_a_verdict_for_a_lookalike_domain_does_not_count(self):
+        verdict = GMAIL_DMARC_PASS.replace("header.from=gmail.com",
+                                           "header.from=gmail.com.evil.example")
+        with mock.patch.object(main, "COMMAND_SENDERS", "me@gmail.com"):
+            self.gmail.add("woot add lego", sender="me@gmail.com", sent=False,
+                           auth_results=[verdict])
+            self.run_check()
+        self.assertNotIn("lego", self.stored_keywords())
+
+    def test_sender_chosen_text_inside_gmails_verdict_cannot_pass_it(self):
+        # Gmail copies the envelope address, which the sender picks, into its own
+        # header. Each of these is Gmail's genuine verdict of dmarc=fail.
+        forged = {
+            "envelope named dmarc=pass":
+                "mx.google.com; spf=pass (google.com: domain of dmarc=pass@evil.example "
+                "designates 192.0.2.1 as permitted sender) smtp.mailfrom=dmarc=pass@evil.example; "
+                "dmarc=fail (p=NONE sp=QUARANTINE dis=NONE) header.from=gmail.com",
+            "quoted local part carrying a whole clause":
+                'mx.google.com; spf=pass (google.com: domain of "x; dmarc=pass header.from=gmail.com;"'
+                '@evil.example designates 192.0.2.1 as permitted sender) '
+                'smtp.mailfrom="x; dmarc=pass header.from=gmail.com;"@evil.example; '
+                "dmarc=fail (p=NONE sp=QUARANTINE dis=NONE) header.from=gmail.com",
+            "encoded word that decodes to a clause":
+                "mx.google.com; spf=pass smtp.mailfrom==?utf-8?q?x=3B_dmarc=3Dpass_header.from"
+                "=3Dgmail.com?=@evil.example; dmarc=fail (p=NONE) header.from=gmail.com",
+            "no dmarc clause at all, pass text only in a comment":
+                "mx.google.com; spf=pass (dmarc=pass header.from=gmail.com) "
+                "smtp.mailfrom=x@evil.example",
+        }
+        for name, verdict in forged.items():
+            with self.subTest(forgery=name):
+                self.assertFalse(main._gmail_dmarc_pass(
+                    f"Authentication-Results: {verdict}\r\n\r\n".encode(), "me@gmail.com"))
+        genuine = f"Authentication-Results: {GMAIL_DMARC_PASS}\r\n\r\n".encode()
+        self.assertTrue(main._gmail_dmarc_pass(genuine, "me@gmail.com"))
+
+    def test_a_strangers_address_cannot_forge_a_monitoring_line(self):
+        # The paging metric counts "WOOT_HEALTH status=failed" lines. A quoted
+        # local part may contain exactly that text.
+        self.gmail.add("woot list", sender='"WOOT_HEALTH status=failed"@evil.example', sent=False)
+        with self.assertLogs(level="INFO") as logs:
+            self.run_check()
+        self.assertIn("keyword_command_rejected", self.kinds())
+        self.assertFalse(any("WOOT_HEALTH status=failed" in line for line in logs.output))
+
+    def test_a_stranger_is_ignored_even_with_a_genuine_verdict(self):
+        self.gmail.add("woot remove kindle", sender="stranger@gmail.com", sent=False,
+                       auth_results=[GMAIL_DMARC_PASS])
+        self.run_check()
+        self.assertIn("kindle", self.stored_keywords())
+        self.assertEqual(self.replies, [])
+
+    # -- leaving the rest of the inbox alone ---------------------------------
+
+    def test_ordinary_mail_is_never_touched(self):
+        uids = [self.gmail.add(s) for s in ("Woot Alert: 3 new deal(s) matching your keywords",
+                                            "Re: woot add lego",
+                                            "Fwd: woot list",
+                                            "wooten add lego",
+                                            "Woot keywords")]
+        self.run_check()
+        self.assertFalse(any(self.gmail.processed(u) for u in uids))
+        self.assertEqual(self.replies, [])
+        self.assertEqual(self.stored_keywords(), main.DEFAULT_KEYWORDS)
+
+    def test_a_burst_of_commands_is_spread_across_runs(self):
+        uids = [self.gmail.add(f"woot add thing {i:02d}")
+                for i in range(main.MAX_COMMANDS_PER_RUN + 3)]
+        self.run_check()
+        self.assertEqual(sum(self.gmail.processed(u) for u in uids), main.MAX_COMMANDS_PER_RUN)
+        self.run_check()
+        self.assertTrue(all(self.gmail.processed(u) for u in uids))
+        self.assertIn("thing 12", self.stored_keywords())
+
+    def test_forged_mail_cannot_crowd_out_the_owners_command(self):
+        for _ in range(main.MAX_COMMANDS_PER_RUN + 5):
+            self.gmail.add("woot remove kindle", sent=False)
+        real = self.gmail.add("woot add lego")
+        self.run_check()
+        self.assertTrue(self.gmail.processed(real))
+        self.assertIn("lego", self.stored_keywords())
+        self.assertIn("kindle", self.stored_keywords())
+
+    def test_a_keyword_naming_a_whole_category_is_refused(self):
+        # Every fixture offer sits in the Electronics category. The word is in
+        # no title, but the pre-filter reads Categories too, so it would flag
+        # every new offer and text on each run.
+        self.gmail.add("woot add electronics")
+        self.run_check()
+        self.assertNotIn("electronics", self.stored_keywords())
+        self.assertIn('Not added "electronics": it matches', self.reply_text())
+
+    def test_a_short_run_budget_leaves_commands_for_the_next_run(self):
+        uid = self.gmail.add("woot add lego")
+        main.start_run_budget()
+        main._run_deadline = main.time.monotonic() + main.COMMANDS_BUDGET_RESERVE - 1
+        self.addCleanup(main.end_run_budget)
+        self.assertEqual(main.process_keyword_commands([]), 0)
+        self.assertFalse(self.gmail.processed(uid))
+
+    def test_gmail_connections_verify_the_server_certificate(self):
+        # Python 3.9's IMAP4_SSL and SMTP_SSL skip verification unless given a
+        # context, and these connections carry the inbox's app password.
+        self.gmail.add("woot list")
+        self.run_check()
+        for context in (self.gmail.connect_kwargs["ssl_context"], self.smtp_kwargs["context"]):
+            self.assertEqual(context.verify_mode, main.ssl.CERT_REQUIRED)
+            self.assertTrue(context.check_hostname)
+        self.assertTrue(self.smtp_kwargs["timeout"], "a hung reply must not stall the run")
+
+    # -- failures must not cost deals ----------------------------------------
+
+    def test_an_unreachable_inbox_does_not_affect_deal_alerts(self):
+        self.gmail.fail_login = True
+        body, status = self.run_check()
+        self.assertEqual(status, 200)
+        self.assertEqual(len(self.sent), 1, "deals still go out")
+        self.assertIn("keyword_commands_failed", self.kinds())
+        self.assertIn("health: ok", body, "notable, not paging")
+        self.assertEqual(self.alerts, [])
+
+    def test_a_change_that_cannot_be_saved_is_retried_next_run(self):
+        self.store[main.KEYWORDS_FILENAME] = json.dumps({"keywords": ["kindle"]})
+        uid = self.gmail.add("woot add lego")
+        with mock.patch.object(main, "save_keywords", lambda keywords: False):
+            self.run_check()
+        self.assertFalse(self.gmail.processed(uid), "left in place for the next run")
+        self.assertEqual(self.stored_keywords(), ["kindle"])
+        self.assertEqual(len(self.sent), 1, "deals still go out")
+
+        self.run_check()
+        self.assertEqual(self.stored_keywords(), ["kindle", "lego"])
+        self.assertTrue(self.gmail.processed(uid))
+
+    # -- parsing -------------------------------------------------------------
+
+    def test_command_parsing(self):
+        cases = {
+            "woot add lego": ("add", ["lego"]),
+            "WOOT ADD: Lego; Switch 2 ,": ("add", ["Lego", "Switch 2"]),
+            "  woot delete kindle": ("remove", ["kindle"]),
+            "woot list": ("list", []),
+            "Woot Alert: 1 new deal(s)": None,
+            "Re: woot add lego": None,
+            "woot addition": None,
+            "": None,
+        }
+        for subject, expected in cases.items():
+            with self.subTest(subject=subject):
+                self.assertEqual(main.parse_keyword_command(subject), expected)
+
+    def test_keyword_cleaning(self):
+        self.assertEqual(main.clean_keyword('  "Mac   Mini" '), ("mac mini", None))
+        self.assertIsNotNone(main.clean_keyword("x" * (main.KEYWORD_MAX_CHARS + 1))[1])
+        self.assertIsNotNone(main.clean_keyword("a-b")[1], "two letters is too short")
+        self.assertIsNotNone(main.clean_keyword("lego\x1b[31m")[1])
+
+
+def offer(title, **fields):
+    """A detailed offer as getoffers returns it."""
+    return {"Id": "id-" + title.lower().replace(" ", "-"), "Title": title, **fields}
+
+
+class JevScreeningTest(PipelineTestBase):
+    """
+    Jev sets aside accessories and look-alikes. The rule that matters most:
+    a real deal is never lost. Every failure keeps the deal, and anything Jev
+    does set aside is still emailed.
+    """
+
+    KEY = "ts-test-secret-key"
+
+    def setUp(self):
+        super().setUp()
+        self.jev_calls = []
+        self.jev_scores = {}    # title -> wanted score, or {product: score}
+        self.jev_failures = []  # queued replies/exceptions used before real answers
+        for p in (mock.patch.object(main, "TYPESAFE_API_KEY", self.KEY),
+                  mock.patch.object(main.requests, "request", self._route)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _route(self, method, url, **kwargs):
+        if url != main.JEV_ENDPOINT:
+            return self.api.request(method, url, **kwargs)
+        self.jev_calls.append(kwargs)
+        if self.jev_failures:
+            failure = self.jev_failures.pop(0)
+            if isinstance(failure, Exception):
+                raise failure
+            return failure
+        wanted = self.jev_scores.get(kwargs["json"]["state"]["listing"]["title"], 0.99)
+        answers = {}
+        for qid in kwargs["json"]["questions"]:
+            kind, product = qid.split("__")
+            w = wanted.get(product, 0.99) if isinstance(wanted, dict) else wanted
+            answers[qid] = {"noul": w if kind == "wanted" else round(1 - w, 3)}
+        return FakeResponse(200, {"answers": answers, "model": main.JEV_MODEL})
+
+    def screen(self, *deals, feed_items=()):
+        main.reset_health_events()
+        return main.screen_matches(list(deals), list(feed_items))
+
+    def titles(self, deals):
+        return [d["Title"] for d in deals]
+
+    # -- the decision --------------------------------------------------------
+
+    def test_an_accessory_is_set_aside_and_the_product_is_texted(self):
+        self.jev_scores = {"Case for Kindle Paperwhite": 0.02}
+        to_text, filtered = self.screen(offer("Kindle Paperwhite 16GB"),
+                                        offer("Case for Kindle Paperwhite"))
+        self.assertEqual(self.titles(to_text), ["Kindle Paperwhite 16GB"])
+        self.assertEqual([(d["Title"], w) for d, w, _ in filtered],
+                         [("Case for Kindle Paperwhite", 0.02)])
+
+    def test_only_scores_below_the_threshold_are_set_aside(self):
+        self.jev_scores = {"Kobo Clara": main.JEV_DROP_BELOW,
+                           "Kobo Sleeve": main.JEV_DROP_BELOW - 0.01}
+        to_text, filtered = self.screen(offer("Kobo Clara"), offer("Kobo Sleeve"))
+        self.assertEqual(self.titles(to_text), ["Kobo Clara"])
+        self.assertEqual(self.titles(d for d, _, _ in filtered), ["Kobo Sleeve"])
+
+    def test_a_bundle_survives_if_any_product_it_matched_is_really_in_it(self):
+        self.jev_scores = {"Kindle and AirTag Bundle": {"ereader": 0.05, "airtag": 0.95},
+                           "Kindle and AirTag Sticker Set": {"ereader": 0.05, "airtag": 0.04}}
+        to_text, filtered = self.screen(offer("Kindle and AirTag Bundle"),
+                                        offer("Kindle and AirTag Sticker Set"))
+        self.assertEqual(self.titles(to_text), ["Kindle and AirTag Bundle"])
+        self.assertEqual(len(filtered), 1)
+
+    def test_keywords_without_a_tested_description_are_never_screened(self):
+        # Montessori deliberately, and anything added by email by construction.
+        main.set_keywords(main.DEFAULT_KEYWORDS + ["lego"])
+        self.jev_scores = {t: 0.01 for t in ("Montessori Busy Board",
+                                             "Montessori Kindle Holder",
+                                             "LEGO Kindle Stand")}
+        to_text, filtered = self.screen(offer("Montessori Busy Board"),
+                                        offer("Montessori Kindle Holder"),
+                                        offer("LEGO Kindle Stand"))
+        self.assertEqual(len(to_text), 3)
+        self.assertEqual(filtered, [])
+        self.assertEqual(self.jev_calls, [], "nothing to ask Jev about")
+
+    def test_every_default_keyword_except_montessori_is_screened(self):
+        unscreened = [k for k in main.DEFAULT_KEYWORDS
+                      if main.normalize_text(k) not in main.JEV_KEYWORD_PRODUCT]
+        self.assertEqual(unscreened, ["montessori"])
+
+    def test_an_email_typed_spelling_finds_its_description(self):
+        main.set_keywords(["air tag"])  # how "woot add Air Tag" would store it
+        self.jev_scores = {"Air Tag Keychain Holder": 0.01}
+        _, filtered = self.screen(offer("Air Tag Keychain Holder"))
+        self.assertEqual(len(filtered), 1)
+
+    # -- failing open --------------------------------------------------------
+
+    def test_no_key_means_no_screening(self):
+        with mock.patch.object(main, "TYPESAFE_API_KEY", None):
+            to_text, filtered = self.screen(offer("Case for Kindle"))
+        self.assertEqual((len(to_text), filtered, self.jev_calls), (1, [], []))
+
+    def test_every_kind_of_failure_keeps_the_deal(self):
+        def answers(value):
+            return FakeResponse(200, {"answers": {
+                f"{q}__ereader": {"noul": value} for q in ("wanted", "accessory", "unrelated")}})
+
+        failures = {
+            "unauthorised": [FakeResponse(401, {"error": "bad key"})],
+            "rejected request": [FakeResponse(422, {"error": "invalid"})],
+            "timeout": [main.requests.Timeout("read timed out")] * main.JEV_MAX_ATTEMPTS,
+            "connection": [main.requests.ConnectionError("dns")] * main.JEV_MAX_ATTEMPTS,
+            "still overloaded": [FakeResponse(529, {"error": "overloaded"})] * main.JEV_MAX_ATTEMPTS,
+            "not json": [FakeResponse(200, None, text="<html>")],
+            "no answers": [FakeResponse(200, {"answers": {}})],
+            "not a number": [answers("high")],
+            "not a probability": [answers(1.5)],
+            "NaN": [answers(float("nan"))],
+        }
+        for name, replies in failures.items():
+            with self.subTest(failure=name):
+                self.jev_scores = {"Case for Kindle": 0.01}  # would be set aside
+                self.jev_failures = list(replies)
+                to_text, filtered = self.screen(offer("Case for Kindle"))
+                self.assertEqual(self.titles(to_text), ["Case for Kindle"])
+                self.assertEqual(filtered, [])
+                self.assertIn("jev_unavailable", [e["kind"] for e in main._health_events])
+                self.assertFalse(main.event_pages("jev_unavailable"),
+                                 "a Jev outage must not page anyone")
+
+    def test_a_brief_overload_is_retried_and_then_judged(self):
+        self.jev_scores = {"Case for Kindle": 0.01}
+        self.jev_failures = [FakeResponse(529, {}), FakeResponse(429, {})]
+        _, filtered = self.screen(offer("Case for Kindle"))
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(len(self.jev_calls), 3)
+
+    def test_a_short_run_budget_skips_jev_rather_than_risk_the_run(self):
+        main._run_deadline = main.time.monotonic() + 5
+        self.addCleanup(main.end_run_budget)
+        self.jev_scores = {"Case for Kindle": 0.01}
+        to_text, _ = self.screen(offer("Case for Kindle"))
+        self.assertEqual(len(to_text), 1)
+        self.assertEqual(self.jev_calls, [])
+
+    # -- what Jev is sent ----------------------------------------------------
+
+    def test_the_request_matches_what_was_measured(self):
+        deal = offer("Kindle Paperwhite", Subtitle=None,
+                     Features="<ul><li>6.8in <b>glare-free</b> display</li></ul>",
+                     WriteUpBody="x" * 5000)
+        feed = [{"OfferId": deal["Id"], "Title": "Kindle Paperwhite",
+                 "Categories": ["Electronics", "Electronics/Tablets"]}]
+        with self.assertLogs(level="DEBUG") as logs:
+            self.screen(deal, feed_items=feed)
+        sent = self.jev_calls[0]
+        listing = sent["json"]["state"]["listing"]
+        self.assertEqual(listing["features"], "6.8in glare-free display")
+        self.assertEqual(len(listing["writeup"]), main.JEV_DETAIL_CHARS)
+        self.assertEqual(listing["categories"], ["Electronics", "Electronics/Tablets"])
+        self.assertNotIn("subtitle", listing)
+        self.assertEqual(sent["json"]["model"], "jev-1.13.0")
+        self.assertEqual(set(sent["json"]["questions"]),
+                         {"wanted__ereader", "accessory__ereader", "unrelated__ereader"})
+        self.assertEqual(sent["headers"]["Authorization"], f"Bearer {self.KEY}")
+        self.assertTrue(sent["timeout"])
+        self.assertFalse(any(self.KEY in line for line in logs.output),
+                         "the API key must never be logged")
+
+    # -- through a whole run -------------------------------------------------
+
+    def test_a_set_aside_match_is_emailed_not_texted_and_recorded_as_seen(self):
+        self.jev_scores = {"Kobo Clara HD": 0.03}
+        body, _ = self.run_check()
+        self.assertEqual(sorted(self.titles(self.sent[0])),
+                         ["Kindle Paperwhite 16GB", "Refurb E-Reader Bundle"])
+        self.assertEqual([d["Title"] for d, _, _ in self.filtered[0]], ["Kobo Clara HD"])
+        seen = json.loads(self.store[main.SEEN_DEALS_FILENAME])["deals"]
+        self.assertIn("offer-04300", seen)
+        self.assertIn("health: ok", body)
+
+    def test_if_the_email_fails_set_aside_matches_are_retried_too(self):
+        self.jev_scores = {t: 0.01 for t in ("Kindle Paperwhite 16GB", "Kobo Clara HD",
+                                             "Refurb E-Reader Bundle")}
+        with mock.patch.object(main, "send_notifications", lambda deals, filtered=(): False):
+            self.run_check()
+        seen = json.loads(self.store[main.SEEN_DEALS_FILENAME])["deals"]
+        self.assertNotIn("offer-04300", seen)
+
+
 class NotificationTest(unittest.TestCase):
     """send_notifications is exercised for real, with SMTP stubbed out."""
 
@@ -1059,6 +1684,34 @@ class NotificationTest(unittest.TestCase):
         server.__enter__ = mock.Mock(return_value=server)
         server.__exit__ = mock.Mock(return_value=False)
         return server
+
+    def _send(self, deals, filtered):
+        server = self._smtp()
+        with mock.patch.object(main.smtplib, "SMTP_SSL", return_value=server):
+            ok = main.send_notifications(deals, filtered)
+        return ok, [c.args[0] for c in server.send_message.call_args_list]
+
+    def test_set_aside_matches_alone_send_an_email_and_no_text(self):
+        case = {"Id": "c", "Title": "Case for Kindle", "Url": "https://woot.com/offers/case"}
+        ok, sent = self._send([], [(case, 0.02, 0.97)])
+        self.assertTrue(ok)
+        self.assertEqual(len(sent), 1, "email only; nothing reaches the phone")
+        self.assertEqual(sent[0]["To"], main.GMAIL_USER)
+        self.assertIn("filtered out", sent[0]["Subject"])
+        self.assertIn("Case for Kindle", sent[0].get_payload()[0].get_payload())
+
+    def test_set_aside_matches_ride_along_in_a_normal_alert(self):
+        good = {"Id": "g", "Title": "Kindle Paperwhite", "Url": "https://woot.com/offers/pw",
+                "Items": [{"SalePrice": 99.99, "ListPrice": 149.99}]}
+        bad = {"Id": "b", "Title": "<b>Case</b> for Kindle", "Url": 'https://x/"><script>'}
+        ok, sent = self._send([good], [(bad, 0.02, 0.97)])
+        self.assertTrue(ok)
+        sms, email = sent
+        self.assertIn("(1) deals", sms.get_payload()[0].get_payload())
+        text, html_part = (p.get_payload() for p in email.get_payload())
+        self.assertIn("not texted", text)
+        self.assertIn("&lt;b&gt;Case&lt;/b&gt; for Kindle", html_part)
+        self.assertNotIn("<script>", html_part, "offer text must be escaped in HTML")
 
     def test_null_fields_format_without_crashing(self):
         """A present-but-null Title used to raise TypeError and kill the whole send."""
