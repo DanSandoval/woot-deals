@@ -73,6 +73,13 @@ def make_item(index):
     }
 
 
+def recent_run_starts(every_minutes, before=None):
+    """Recorded run starts, oldest first, the last one a full gap before `before`."""
+    before = before or datetime.now(timezone.utc)
+    return [(before - timedelta(minutes=every_minutes * k)).isoformat()
+            for k in range(main.RUN_START_HISTORY, 0, -1)]
+
+
 class FakeResponse:
     def __init__(self, status_code, payload=None, headers=None, text=""):
         self.status_code = status_code
@@ -314,8 +321,10 @@ class PipelineTestBase(unittest.TestCase):
         # fixture mirrors that. Seed it as already-known so ordinary runs are
         # quiet -- alerting on a permanently capped feed every run would make the
         # signal worthless. The newly-capped tests exercise the change detection.
+        # Runs have been coming every 20 minutes, as they do in production, so
+        # the paginated fallback can price the rest of the day.
         self.store[main.HEALTH_STATE_FILENAME] = json.dumps(
-            {"capped_feeds": ["All"]})
+            {"capped_feeds": ["All"], "run_starts": recent_run_starts(20)})
 
         patches = [
             mock.patch.object(main.requests, "request", self.api.request),
@@ -876,7 +885,8 @@ class MultiFeedTest(PipelineTestBase):
         self.api.serve_full_feed = False  # forces All to want the fallback
         self.store[main.HEALTH_STATE_FILENAME] = json.dumps({
             "quota": {"date": main._utc_today(),
-                      "used": main.DAILY_REQUEST_CEILING - 5},
+                      "used": main.WOOT_DAILY_QUOTA - main.QUOTA_MARGIN - 5},
+            "run_starts": recent_run_starts(20),
         })
         main.start_run_budget()  # how a real run loads the day's prior spend
         items, complete = main.fetch_feed()
@@ -896,7 +906,7 @@ class MultiFeedTest(PipelineTestBase):
         })
         main.start_run_budget()
         self.assertEqual(main.load_quota_used(), 0)
-        self.assertEqual(main.quota_remaining(), main.DAILY_REQUEST_CEILING)
+        self.assertEqual(main.quota_spent(), 0)
 
     def test_quota_usage_accumulates_across_runs(self):
         self.api.serve_full_feed = True
@@ -913,6 +923,133 @@ class MultiFeedTest(PipelineTestBase):
         with mock.patch.object(main, "load_health_state",
                                side_effect=RuntimeError("store down")):
             self.assertEqual(main.load_quota_used(), 0)
+            main.start_run_budget()
+        # Assuming nothing was spent must not release the fallback: the same
+        # unreadable record has no run history to reserve the day against.
+        self.assertIsNone(main._run_gap)
+        self.assertEqual(main.spare_requests(), 0)
+
+    def test_fallback_is_refused_without_run_history(self):
+        # The first run after this was deployed, or after the record was lost,
+        # cannot tell how many runs are left in the day.
+        self.api.serve_full_feed = False
+        self.store[main.HEALTH_STATE_FILENAME] = json.dumps({})
+        main.reset_health_events()
+        main.start_run_budget()
+        items, complete = main.fetch_feed()
+
+        self.assertFalse(complete)
+        skipped = [e for e in main._health_events if e["kind"] == "feed_fallback_skipped"]
+        self.assertTrue(skipped)
+        self.assertIn("no run history", skipped[0]["detail"])
+
+    def test_each_run_records_when_it_started(self):
+        self.run_check()
+        self.run_check()
+        starts = self.health_state()["run_starts"]
+        self.assertEqual(len(starts), main.RUN_START_HISTORY,
+                         "the record keeps a fixed number of recent starts")
+        times = [datetime.fromisoformat(s) for s in starts]
+        self.assertEqual(times, sorted(times))
+        self.assertLess(datetime.now(timezone.utc) - times[-2], timedelta(minutes=1),
+                        "both runs just now must be the two newest entries")
+
+
+class QuotaProjectionTest(unittest.TestCase):
+    """
+    The paginated fallback may spend only what the rest of the day's runs will
+    not need. These replay whole UTC days at a given interval, starting each run
+    as late as production runs actually start after their scheduled time.
+    """
+
+    # Seconds after the scheduled time, from three days of production starts:
+    # the 10th percentile, median, 90th percentile and the latest seen.
+    START_DELAYS = [5, 32, 57, 9, 253, 31, 40]
+    DAY = datetime(2026, 10, 9, tzinfo=timezone.utc)
+
+    def setUp(self):
+        saved = (main._quota_prior, main._request_count, main._run_gap)
+
+        def restore():
+            main._quota_prior, main._request_count, main._run_gap = saved
+        self.addCleanup(restore)
+
+    def replay_day(self, every_minutes):
+        """
+        (run number, spare requests, what the rest of the day then really costs)
+        for every run, as its first feed comes back short and wants the fallback.
+        """
+        feeds = len(main.FEED_NAMES)
+        runs = 24 * 60 // every_minutes
+        delays = self.START_DELAYS
+        starts = [self.DAY - timedelta(minutes=every_minutes * k)
+                  + timedelta(seconds=delays[-k % len(delays)])
+                  for k in range(main.RUN_START_HISTORY, 0, -1)]
+        for n in range(runs):
+            now = (self.DAY + timedelta(minutes=every_minutes * n)
+                   + timedelta(seconds=delays[n % len(delays)]))
+            state = {"run_starts": [s.isoformat() for s in starts]}
+            main._run_gap = main.measured_run_gap(state, now)
+            main._quota_prior, main._request_count = n * feeds, 1
+            later = (runs - n - 1) * feeds + (feeds - 1)
+            yield n, main.spare_requests(now), later
+            starts = (starts + [now])[-main.RUN_START_HISTORY:]
+
+    def assert_fallback_fits_all_day(self, every_minutes):
+        for n, spare, later in self.replay_day(every_minutes):
+            self.assertGreaterEqual(
+                spare, main.PAGINATED_FETCH_COST,
+                f"run {n} at {every_minutes}-minute runs could not afford the fallback")
+            self.assertLessEqual(
+                main.quota_spent() + spare + later,
+                main.WOOT_DAILY_QUOTA - main.QUOTA_MARGIN,
+                f"run {n} reserved less than the rest of the day really costs")
+
+    def test_twenty_minute_runs_keep_the_fallback_affordable_all_day(self):
+        # The fixed 800 ceiling this replaced would have refused it from 22:40
+        # UTC on, once 20-minute runs had spent more than 745.
+        self.assert_fallback_fits_all_day(20)
+
+    def test_thirty_minute_runs_keep_the_fallback_affordable_all_day(self):
+        self.assert_fallback_fits_all_day(30)
+
+    def test_fifteen_minute_runs_never_get_the_fallback(self):
+        # 96 runs x 11 feeds is over the quota on its own; the fallback must not
+        # add to a day that is already short.
+        for n, spare, _ in self.replay_day(15):
+            self.assertLess(spare, main.PAGINATED_FETCH_COST, f"run {n}")
+
+    def test_gap_ignores_a_run_started_by_hand(self):
+        now = self.DAY
+        starts = recent_run_starts(20, before=now)
+        starts[-1] = (now - timedelta(minutes=3)).isoformat()
+        starts.insert(-1, (now - timedelta(minutes=20)).isoformat())
+        gap = main.measured_run_gap({"run_starts": starts[-main.RUN_START_HISTORY:]}, now)
+        self.assertEqual(gap, 20 * 60)
+
+    def test_gap_ignores_the_long_gap_after_an_outage(self):
+        now = self.DAY
+        starts = recent_run_starts(20, before=now - timedelta(hours=3))
+        starts.append((now - timedelta(minutes=20)).isoformat())
+        gap = main.measured_run_gap({"run_starts": starts[-main.RUN_START_HISTORY:]}, now)
+        self.assertEqual(gap, 20 * 60)
+
+    def test_gap_is_unknown_without_usable_history(self):
+        now = self.DAY
+        self.assertIsNone(main.measured_run_gap({}, now))
+        self.assertIsNone(main.measured_run_gap({"run_starts": ["not a time"]}, now))
+        # A timestamp without a timezone cannot be compared with one that has it.
+        self.assertIsNone(main.measured_run_gap(
+            {"run_starts": ["2026-10-08T23:40:00"]}, now))
+        self.assertIsNone(main.measured_run_gap({"run_starts": "oops"}, now))
+        self.assertIsNone(main.measured_run_gap({"run_starts": 5}, now))
+        # One bad entry does not discard the good ones around it.
+        starts = recent_run_starts(20, before=now)
+        starts[2] = "not a time"
+        self.assertEqual(main.measured_run_gap({"run_starts": starts}, now), 20 * 60)
+        # A scheduler retry seconds later says nothing about the schedule.
+        self.assertIsNone(main.measured_run_gap(
+            {"run_starts": [(now - timedelta(seconds=30)).isoformat()]}, now))
 
 
 class HealthAlertingTest(PipelineTestBase):

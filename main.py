@@ -306,12 +306,19 @@ DETAIL_BATCH_SIZE = 10  # offer IDs per getoffers call
 # unnoticed for months because polling 51 pages hourly needs 1224/day -- 22% over
 # -- so the feed died every evening and recovered by itself at midnight.
 WOOT_DAILY_QUOTA = 1000
-# Stop well short of the real ceiling. The gap absorbs retries and leaves the
-# later runs of the day enough budget to still fetch offer details.
-DAILY_REQUEST_CEILING = 800
+# Kept back from the paginated fallback for spend the schedule does not predict:
+# offer-detail batches, 429 retries and runs started by hand.
+QUOTA_MARGIN = 100
 # What one full paginated crawl costs: ~51 pages plus retries. Used to decide
 # whether the day can still afford the fallback path.
 PAGINATED_FETCH_COST = 55
+# The fallback may only spend what the runs still due before midnight UTC will
+# not need, and how often runs come is measured rather than assumed. This
+# replaced a fixed ceiling of 800, which suited 30-minute runs and would have
+# refused the fallback every evening at 20-minute runs, whose feeds alone cost
+# ~790 a day. The median gap over this many recent starts ignores a run started
+# by hand and the long gap after an outage.
+RUN_START_HISTORY = 7
 
 # Cloud Scheduler gives this service a limited attempt deadline. Staying inside
 # it matters: an overrunning request gets retried by the scheduler, which would
@@ -414,7 +421,7 @@ FEED_CAP_CLEAR_RATIO = 0.85
 # and a feed that silently serves page 1 fifty times would inflate it and then
 # make the eventual fix look like a regression.
 FEED_SHRINK_RATIO = 0.70
-FEED_BASELINE_RUNS = 24        # ~1 day of hourly runs
+FEED_BASELINE_RUNS = 24        # 8h at 20-minute runs; feed size swings ~8% in a day
 FEED_BASELINE_MIN_SAMPLES = 6  # below this the ratio check is not evaluated
 
 # Contract checks on the feed's shape. These catch the case where every pipe
@@ -489,6 +496,11 @@ _request_count = 0
 
 # Requests earlier runs already spent today, read once at the start of a run.
 _quota_prior = 0
+
+# When this run started, and the typical seconds between runs measured from the
+# recent starts (None until there are at least two).
+_run_started_at = None
+_run_gap = None
 
 # Problems recorded during the current run, drained by report_run_health()
 _health_events = []
@@ -1428,7 +1440,7 @@ def _utc_today():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def load_quota_used():
+def load_quota_used(state=None):
     """
     Requests already spent against today's Woot quota by earlier runs.
 
@@ -1436,11 +1448,14 @@ def load_quota_used():
     so it starts over at zero rather than carrying yesterday's total forward.
     """
     # Never raises: quota bookkeeping must not be able to break the job, same
-    # rule the rest of the health code follows. Falling back to 0 can at worst
-    # permit one extra paginated fallback (~51 requests) against an 800 ceiling,
-    # whereas assuming the quota is spent would refuse to run at all.
+    # rule the rest of the health code follows. Falling back to 0 cannot release
+    # the paginated fallback: an unreadable record holds no run history either,
+    # and without one spare_requests() refuses it. Assuming the quota is spent
+    # instead would refuse to run at all.
     try:
-        quota = (load_health_state().get("quota") or {})
+        if state is None:
+            state = load_health_state()
+        quota = (state.get("quota") or {})
         if quota.get("date") != _utc_today():
             return 0
         return max(0, int(quota.get("used", 0)))
@@ -1449,19 +1464,59 @@ def load_quota_used():
         return 0
 
 
+def measured_run_gap(state, now):
+    """
+    Typical seconds between runs, from the recorded run starts and this one.
+
+    The median rather than the latest gap, so a run started by hand or the long
+    gap after an outage does not move it. None until there are two starts.
+    """
+    stamps = state.get("run_starts")
+    starts = []
+    for stamp in stamps[-RUN_START_HISTORY:] if isinstance(stamps, list) else []:
+        # One unreadable entry is skipped rather than discarding the rest.
+        try:
+            start = datetime.fromisoformat(stamp)
+        except (TypeError, ValueError):
+            continue
+        if start.tzinfo is not None:
+            starts.append(start)
+    starts = sorted(starts) + [now]
+    gaps = sorted(
+        (later - earlier).total_seconds()
+        for earlier, later in zip(starts, starts[1:])
+    )
+    # Two starts closer together than one run's time budget were not both
+    # scheduled: one was a scheduler retry or a run started by hand.
+    gaps = [g for g in gaps if g >= RUN_BUDGET_SECONDS]
+    if not gaps:
+        return None
+    # The lower median: a shorter gap means more runs left to pay for, which errs
+    # toward keeping requests back.
+    return gaps[(len(gaps) - 1) // 2]
+
+
 def quota_spent():
     """Requests spent against today's quota, including this run so far."""
     return _quota_prior + _request_count
 
 
-def quota_remaining():
+def spare_requests(now=None):
     """
-    Requests left before this run should stop spending.
+    Requests this run can spend beyond its feeds without starving later runs.
 
-    Measured against DAILY_REQUEST_CEILING rather than the true 1000, so there is
-    always headroom left for the rest of the day.
+    The runs still due before midnight UTC are priced at one request per feed,
+    and this run's feeds are counted in full even when some are already spent.
+    Without a measured gap the later runs cannot be priced, so nothing is spare.
     """
-    return DAILY_REQUEST_CEILING - quota_spent()
+    if not _run_gap:
+        return 0
+    now = now or datetime.now(timezone.utc)
+    midnight = datetime.combine(now.date() + timedelta(days=1),
+                                datetime.min.time(), timezone.utc)
+    later_runs = int((midnight - now).total_seconds() // _run_gap)
+    committed = (later_runs + 1) * len(FEED_NAMES)
+    return WOOT_DAILY_QUOTA - QUOTA_MARGIN - quota_spent() - committed
 
 
 def save_health_state(state):
@@ -1666,6 +1721,12 @@ def _report_run_health(status, metrics):
     except (TypeError, ValueError):
         prior = 0
     state["quota"] = {"date": today, "used": prior + _request_count}
+    # Remember when recent runs started, so the next one can measure how often
+    # runs come and reserve the rest of the day's quota for them.
+    if _run_started_at:
+        starts = [s for s in (state.get("run_starts") or []) if isinstance(s, str)]
+        starts.append(_run_started_at.isoformat())
+        state["run_starts"] = starts[-RUN_START_HISTORY:]
     # Remember which feeds are capped so the next run alerts only on a change.
     current_caps = capped_feeds(state.get("capped_feeds"))
     if current_caps or state.get("capped_feeds"):
@@ -1769,13 +1830,22 @@ def _report_run_health(status, metrics):
 
 def start_run_budget():
     """Begin the wall-clock and daily-quota budgets for one scheduled run."""
-    global _run_deadline, _request_count, _quota_prior
+    global _run_deadline, _request_count, _quota_prior, _run_started_at, _run_gap
     _run_deadline = time.monotonic() + RUN_BUDGET_SECONDS
     _request_count = 0
-    _quota_prior = load_quota_used()
+    _run_started_at = datetime.now(timezone.utc)
+    try:
+        state = load_health_state()
+    except Exception as e:
+        logging.warning(f"Could not read the health record, budgeting without it: {e}")
+        state = {}
+    _quota_prior = load_quota_used(state)
+    _run_gap = measured_run_gap(state, _run_started_at)
+    cadence = (f"runs about every {_run_gap / 60:.0f} min" if _run_gap
+               else "no run history yet")
     logging.info(
-        f"Run starting with {_quota_prior}/{DAILY_REQUEST_CEILING} of today's "
-        f"request ceiling already spent (hard quota {WOOT_DAILY_QUOTA}/day)"
+        f"Run starting with {_quota_prior}/{WOOT_DAILY_QUOTA} of today's Woot "
+        f"quota already spent; {cadence}"
     )
 
 
@@ -1980,17 +2050,17 @@ def _fetch_feed_with_fallback(feed_name):
     if ok:
         return items, True
 
-    if quota_remaining() < PAGINATED_FETCH_COST:
-        logging.error(
-            f"Skipping paginated fallback for '{feed_name}': only "
-            f"{quota_remaining()} requests left under today's ceiling of "
-            f"{DAILY_REQUEST_CEILING}, need ~{PAGINATED_FETCH_COST}"
-        )
+    spare = spare_requests()
+    if spare < PAGINATED_FETCH_COST:
+        why = (f"only {spare} requests are spare after reserving the rest of "
+               f"today's runs, and the retry needs ~{PAGINATED_FETCH_COST}"
+               if _run_gap else
+               "there is no run history yet to reserve the rest of today's runs")
+        logging.error(f"Skipping paginated fallback for '{feed_name}': {why}")
         record_health_event(
             "feed_fallback_skipped",
-            f"the single-request fetch of '{feed_name}' failed and the day's "
-            f"remaining request budget ({quota_remaining()}) could not afford "
-            f"the paginated retry"
+            f"the single-request fetch of '{feed_name}' failed and the "
+            f"paginated retry was not affordable: {why}"
         )
         return [], False
 

@@ -5,7 +5,7 @@ A Google Cloud Run service that monitors Woot.com for deals matching your keywor
 ## Overview
 
 This service:
-- Polls all 11 Woot feeds every 30 minutes and merges them into one
+- Polls all 11 Woot feeds every 20 minutes and merges them into one
   deduplicated catalogue (~13,600 offers), because the `All` feed alone is
   capped at 5000 items and shows only ~40% of what is for sale
 - Filters deals by a keyword list you edit by email (see Configuration)
@@ -65,7 +65,7 @@ This service:
 5. Set up Cloud Scheduler:
    ```
    gcloud scheduler jobs create http woot-deals-tracker \
-     --schedule="0 * * * *" \
+     --schedule="*/20 * * * *" \
      --uri="https://YOUR-CLOUD-RUN-URL" \
      --http-method=GET \
      --location=REGION
@@ -127,7 +127,7 @@ subject line:
 | `woot list` | change nothing, just reply with the list |
 | `woot unscreen robe` | turn the Jev screen off for a keyword, so every match is texted |
 
-Each run (every 30 minutes) applies waiting commands before matching, so a new
+Each run (every 20 minutes) applies waiting commands before matching, so a new
 keyword already catches new listings in that run. The reply lists the result, the
 whole list with how each keyword is screened, and the offers on Woot that match a
 new keyword right now. Those were already seen and will not alert; only listings
@@ -476,6 +476,22 @@ Omitting the `page` parameter returns a whole feed in ONE request, so a run now
 costs 11 requests (one per feed) rather than 51 per feed. Daily spend is tracked
 across runs in `health_state.json`, keyed by UTC date because that is when the
 quota resets, and reported as `quota_used=` on every run.
+
+The schedule is limited by this quota. Cron can only space runs evenly at
+intervals that divide the hour, and the feeds alone cost:
+
+| Every | Runs/day | Requests/day | Fits in 1000? |
+|---|---|---|---|
+| 30 min | 48 | 528 | yes |
+| 20 min (current) | 72 | 792 | yes, ~200 to spare |
+| 15 min | 96 | 1056 | no |
+
+The paginated fallback (~55 requests) is allowed only when the day can still pay
+for every run due before midnight UTC, with 100 requests held back for detail
+batches, retries and runs started by hand. How often runs come is measured from
+the recent run starts in `health_state.json`, not assumed, so changing the
+schedule needs no code change. A fixed ceiling of 800 used to do this job; it
+suited 30-minute runs and would have blocked the fallback every evening at 20.
 
 If the logs show `complete=False` in the run summary, the feed was cut short and
 the offers on the pages that were never reached are deliberately left unrecorded
