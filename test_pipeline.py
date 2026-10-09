@@ -1845,16 +1845,18 @@ class AutoScreenTest(JevTestBase):
 
     def test_claudes_answer_is_cleaned_before_it_is_trusted(self):
         self.claude.answers["robe"] = described("robe", keep=[
-            "Plush Robe", "Plush Robe", "Spa\x07 Robe", "Slippers",
-            "Hooded Robe " + "x" * 300, "Kimono Robe"],
+            "Plush Robe", "Plush Robe", "Spa\x07 Robe", "  ",
+            "Hooded Robe " + "x" * 300, "Hotel Spa Kimono, Waffle Knit"],
             set_aside=["Plush Robe", "Wardrobe Cabinet"])
         answer = main._describe_keyword("robe")
         self.assertEqual(answer["keep"][:2], ["Plush Robe", "Spa Robe"])
-        self.assertEqual(len(answer["keep"]), 4, "duplicates and titles without the keyword go")
+        self.assertEqual(len(answer["keep"]), 4, "duplicates and blanks go")
         self.assertEqual(len(answer["keep"][2]), 160)
+        # The product's own name tests the description even without the keyword.
+        self.assertIn("Hotel Spa Kimono, Waffle Knit", answer["keep"])
         self.assertEqual(answer["set_aside"], ["Wardrobe Cabinet"])
 
-        self.claude.answers["robe"] = described("robe", keep=["Plush Robe", "Slippers"])
+        self.claude.answers["robe"] = described("robe", keep=["Plush Robe", "", "Plush Robe"])
         with self.assertRaises(ValueError):
             main._describe_keyword("robe")
         self.claude.answers["robe"] = "max_tokens"

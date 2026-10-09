@@ -2528,14 +2528,16 @@ def _describe_keyword(keyword):
         raise RuntimeError(f"Claude stopped early ({response.stop_reason})")
     answer = json.loads(next(b.text for b in response.content if b.type == "text"))
 
-    norm = normalize_text(keyword)
-
     def samples(name, exclude=()):
-        # A sample without the keyword in it could never reach the screen.
+        # Titles are not required to contain the keyword. Claude often writes
+        # the product's real name instead ("Ray-Ban Meta Wayfarer Smart
+        # Glasses" for "meta glasses"), which tests the description just as
+        # well; requiring the exact phrase rejected most samples for
+        # multi-word keywords.
         titles = []
         for raw in answer.get(name) or []:
             title = _printable(" ".join(str(raw).split()), 160)
-            if norm in normalize_text(title) and title not in titles and title not in exclude:
+            if title and title not in titles and title not in exclude:
                 titles.append(title)
         return titles[:AUTO_SCREEN_MAX_SAMPLES]
 
