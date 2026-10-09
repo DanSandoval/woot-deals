@@ -12,6 +12,7 @@ import json
 import os
 import unittest
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest import mock
 
 os.environ.setdefault("WOOT_API_KEY", "test-key")
@@ -330,6 +331,7 @@ class PipelineTestBase(unittest.TestCase):
             # A developer machine may have a TypeSafe key in its environment;
             # screening is switched on only by the tests that exercise it.
             mock.patch.object(main, "TYPESAFE_API_KEY", None),
+            mock.patch.object(main, "ANTHROPIC_API_KEY", None),
         ]
         for p in patches:
             p.start()
@@ -339,6 +341,8 @@ class PipelineTestBase(unittest.TestCase):
         # from the defaults and put them back afterwards.
         main.set_keywords(main.DEFAULT_KEYWORDS)
         self.addCleanup(main.set_keywords, main.DEFAULT_KEYWORDS)
+        main.set_screens({})
+        self.addCleanup(main.set_screens, {})
 
     def _smtp(self, *args, **kwargs):
         self.smtp_kwargs = kwargs
@@ -1489,12 +1493,8 @@ def offer(title, **fields):
     return {"Id": "id-" + title.lower().replace(" ", "-"), "Title": title, **fields}
 
 
-class JevScreeningTest(PipelineTestBase):
-    """
-    Jev sets aside accessories and look-alikes. The rule that matters most:
-    a real deal is never lost. Every failure keeps the deal, and anything Jev
-    does set aside is still emailed.
-    """
+class JevTestBase(PipelineTestBase):
+    """A fake TypeSafe API: Jev's score for a listing is looked up by its title."""
 
     KEY = "ts-test-secret-key"
 
@@ -1532,6 +1532,14 @@ class JevScreeningTest(PipelineTestBase):
     def titles(self, deals):
         return [d["Title"] for d in deals]
 
+
+class JevScreeningTest(JevTestBase):
+    """
+    Jev sets aside accessories and look-alikes. The rule that matters most:
+    a real deal is never lost. Every failure keeps the deal, and anything Jev
+    does set aside is still emailed.
+    """
+
     # -- the decision --------------------------------------------------------
 
     def test_an_accessory_is_set_aside_and_the_product_is_texted(self):
@@ -1557,8 +1565,8 @@ class JevScreeningTest(PipelineTestBase):
         self.assertEqual(self.titles(to_text), ["Kindle and AirTag Bundle"])
         self.assertEqual(len(filtered), 1)
 
-    def test_keywords_without_a_tested_description_are_never_screened(self):
-        # Montessori deliberately, and anything added by email by construction.
+    def test_keywords_without_a_screen_are_never_screened(self):
+        # Montessori deliberately, and "lego" because no screen was set up for it.
         main.set_keywords(main.DEFAULT_KEYWORDS + ["lego"])
         self.jev_scores = {t: 0.01 for t in ("Montessori Busy Board",
                                              "Montessori Kindle Holder",
@@ -1650,6 +1658,8 @@ class JevScreeningTest(PipelineTestBase):
         self.assertEqual(sent["json"]["model"], "jev-1.13.0")
         self.assertEqual(set(sent["json"]["questions"]),
                          {"wanted__ereader", "accessory__ereader", "unrelated__ereader"})
+        self.assertIn(main.JEV_ACCESSORY_EXAMPLES,
+                      sent["json"]["questions"]["accessory__ereader"]["instructions"]["question"])
         self.assertEqual(sent["headers"]["Authorization"], f"Bearer {self.KEY}")
         self.assertTrue(sent["timeout"])
         self.assertFalse(any(self.KEY in line for line in logs.output),
@@ -1674,6 +1684,348 @@ class JevScreeningTest(PipelineTestBase):
             self.run_check()
         seen = json.loads(self.store[main.SEEN_DEALS_FILENAME])["deals"]
         self.assertNotIn("offer-04300", seen)
+
+
+def described(keyword, screen=True, **overrides):
+    """An answer Claude could give for `keyword`: six listings to keep, two look-alikes."""
+    name = keyword.title()
+    answer = {
+        "screen": screen,
+        "reading": f"Any {keyword} itself, new or refurbished, alone or in a bundle.",
+        "wanted_product": f"A {keyword}: the product itself, new, refurbished or used, "
+                          f"alone or in a bundle that includes it.",
+        "accessory_examples": "a mounting bracket, cover or replacement part",
+        "keep": [f"Acme {name} Deluxe", f"Refurbished {name}", f"{name} 2-Pack",
+                 f"{name} Starter Bundle", f"Brand New {name} (2026 Model)",
+                 f"Acme Pro Series {name} with Extended Warranty and Free Shipping"],
+        "set_aside": [f"Mounting Bracket for {name}", f"Cover for {name}"],
+    }
+    if not screen:
+        answer.update(wanted_product="", accessory_examples="", keep=[], set_aside=[])
+    answer.update(overrides)
+    return answer
+
+
+class FakeClaude:
+    """anthropic.Anthropic, as far as describing a keyword uses it."""
+
+    def __init__(self):
+        self.calls = []
+        self.client_kwargs = []
+        self.answers = {}  # keyword -> answer, an exception, or a stop_reason to stop with
+        self.beta = SimpleNamespace(messages=SimpleNamespace(create=self._create))
+
+    def __call__(self, **kwargs):
+        self.client_kwargs.append(kwargs)
+        return self
+
+    def keywords(self):
+        return [c["messages"][0]["content"].removeprefix("Keyword: ") for c in self.calls]
+
+    def _create(self, **kwargs):
+        self.calls.append(kwargs)
+        keyword = kwargs["messages"][0]["content"].removeprefix("Keyword: ")
+        answer = self.answers.get(keyword) or described(keyword)
+        if isinstance(answer, Exception):
+            raise answer
+        if isinstance(answer, str):
+            return SimpleNamespace(stop_reason=answer, content=[])
+        return SimpleNamespace(stop_reason="end_turn", content=[
+            SimpleNamespace(type="thinking", thinking=""),
+            SimpleNamespace(type="text", text=json.dumps(answer))])
+
+
+class AutoScreenTest(JevTestBase):
+    """
+    A keyword with no hand-tested description gets one from Claude when it is
+    added. Jev scores Claude's own sample listings with it, and the screen is
+    used only if every listing it should keep clears AUTO_SCREEN_MIN_KEPT. Any
+    failure leaves the keyword unscreened, which texts every match as before.
+    """
+
+    CLAUDE_KEY = "sk-ant-test-secret-key"
+    WIDGET = "widget 1234"  # matches exactly one feed offer, "Widget 1234"
+
+    def setUp(self):
+        super().setUp()
+        self.claude = FakeClaude()
+        for p in (mock.patch.object(main, "ANTHROPIC_API_KEY", self.CLAUDE_KEY),
+                  mock.patch.object(main.anthropic, "Anthropic", self.claude)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def stored_screens(self):
+        return json.loads(self.store.get(main.KEYWORD_SCREENS_FILENAME,
+                                         '{"screens": {}}'))["screens"]
+
+    def store_list(self, *extra, screens=None):
+        self.store[main.KEYWORDS_FILENAME] = json.dumps(
+            {"keywords": main.DEFAULT_KEYWORDS + list(extra)})
+        if screens is not None:
+            self.store[main.KEYWORD_SCREENS_FILENAME] = json.dumps({"screens": screens})
+
+    def screen_on(self, keyword, **overrides):
+        entry = {"status": "on", "keyword": keyword, "reading": f"Any {keyword}.",
+                 "wanted_product": f"A {keyword} itself.", "accessory_examples": "a cover",
+                 "check": {"keep": {f"Acme {keyword}": 0.99}, "set_aside": {}},
+                 "model": main.AUTO_SCREEN_MODEL, "jev_model": main.JEV_MODEL,
+                 "at": "2026-10-01T00:00:00+00:00"}
+        entry.update(overrides)
+        return entry
+
+    def payloads(self):
+        return [r.get_payload() for r in self.replies]
+
+    def texted(self):
+        return [d["Title"] for batch in self.sent for d in batch]
+
+    def set_aside(self):
+        return [d["Title"] for batch in self.filtered for d, _, _ in batch]
+
+    # -- setting a screen up -------------------------------------------------
+
+    def test_an_added_keyword_is_described_checked_and_reported_in_the_reply(self):
+        self.jev_scores = {"Mounting Bracket for Widget 1234": 0.01}
+        uid = self.gmail.add(f"woot add {self.WIDGET}")
+        self.run_check()
+        self.assertEqual(self.claude.keywords(), [self.WIDGET])
+        entry = self.stored_screens()[self.WIDGET]
+        self.assertEqual(entry["status"], "on")
+        self.assertEqual(entry["jev_model"], main.JEV_MODEL)
+        self.assertEqual(len(entry["check"]["keep"]), 6)
+        self.assertTrue(self.gmail.processed(uid))
+        self.assertEqual(len(self.replies), 1, "the result rides in the add reply itself")
+        reply = self.payloads()[0]
+        for text in ("Added: widget 1234", 'Jev screen for "widget 1234": on',
+                     "Reading: Any widget 1234 itself", "set aside 1 of 2 look-alikes",
+                     "0.99  Widget 1234", 'send "woot unscreen widget 1234"'):
+            self.assertIn(text, reply)
+        self.assertRegex(reply, r"widget 1234\s+screened \(auto\)")
+        self.assertRegex(reply, r"kindle\s+screened\n")
+        self.assertRegex(reply, r"montessori\s+not screened")
+
+    def test_the_new_screen_judges_matches_from_the_same_run_on(self):
+        self.jev_scores = {"Widget 1234": 0.02}
+        self.gmail.add(f"woot add {self.WIDGET}")
+        self.run_check()
+        self.assertIn("Widget 1234", self.set_aside())
+        self.assertNotIn("Widget 1234", self.texted())
+        product = main._auto_product_id(self.WIDGET)
+        questions = [c["json"]["questions"] for c in self.jev_calls
+                     if f"wanted__{product}" in c["json"]["questions"]][-1]
+        self.assertIn("A widget 1234: the product itself",
+                      questions[f"wanted__{product}"]["instructions"]["wanted_product"])
+        self.assertIn("a mounting bracket, cover or replacement part",
+                      questions[f"accessory__{product}"]["instructions"]["question"])
+        self.assertIn("set aside  0.02  Widget 1234", self.payloads()[0])
+
+    def test_a_description_that_fails_its_self_check_is_not_used(self):
+        # 0.3 would still be texted, but it is too close to the line to trust.
+        self.jev_scores = {"Refurbished Widget 1234": 0.3, "Widget 1234": 0.01}
+        self.gmail.add(f"woot add {self.WIDGET}")
+        self.run_check()
+        entry = self.stored_screens()[self.WIDGET]
+        self.assertEqual(entry["status"], "off")
+        self.assertIn('"Refurbished Widget 1234"', entry["reason"])
+        self.assertIn("Widget 1234", self.texted())
+        self.assertIn('Jev screen for "widget 1234": off', self.payloads()[0])
+        self.run_check()
+        self.assertEqual(len(self.claude.calls), 1, "a failed check is final, not retried")
+
+    def test_a_keyword_that_names_no_product_is_left_unscreened(self):
+        self.claude.answers[self.WIDGET] = described(
+            self.WIDGET, screen=False, reading="It names a style, not a product.")
+        self.gmail.add(f"woot add {self.WIDGET}")
+        self.run_check()
+        self.assertEqual(self.stored_screens()[self.WIDGET]["status"], "off")
+        self.assertIn("Why: It names a style, not a product.", self.payloads()[0])
+        product = main._auto_product_id(self.WIDGET)
+        self.assertFalse(any(f"wanted__{product}" in c["json"]["questions"]
+                             for c in self.jev_calls))
+
+    def test_claudes_answer_is_cleaned_before_it_is_trusted(self):
+        self.claude.answers["robe"] = described("robe", keep=[
+            "Plush Robe", "Plush Robe", "Spa\x07 Robe", "Slippers",
+            "Hooded Robe " + "x" * 300, "Kimono Robe"],
+            set_aside=["Plush Robe", "Wardrobe Cabinet"])
+        answer = main._describe_keyword("robe")
+        self.assertEqual(answer["keep"][:2], ["Plush Robe", "Spa Robe"])
+        self.assertEqual(len(answer["keep"]), 4, "duplicates and titles without the keyword go")
+        self.assertEqual(len(answer["keep"][2]), 160)
+        self.assertEqual(answer["set_aside"], ["Wardrobe Cabinet"])
+
+        self.claude.answers["robe"] = described("robe", keep=["Plush Robe", "Slippers"])
+        with self.assertRaises(ValueError):
+            main._describe_keyword("robe")
+        self.claude.answers["robe"] = "max_tokens"
+        with self.assertRaises(RuntimeError):
+            main._describe_keyword("robe")
+
+    def test_the_claude_request(self):
+        self.gmail.add(f"woot add {self.WIDGET}")
+        with self.assertLogs(level="DEBUG") as logs:
+            self.run_check()
+        call = self.claude.calls[0]
+        self.assertEqual(call["model"], "claude-opus-5-5")
+        self.assertEqual(call["output_config"], {
+            "effort": main.AUTO_SCREEN_EFFORT,
+            "format": {"type": "json_schema", "schema": main.AUTO_SCREEN_SCHEMA}})
+        self.assertEqual((call["fallbacks"], call["betas"]),
+                         ("default", ["server-side-fallback-2026-07-01"]))
+        self.assertEqual(call["messages"], [{"role": "user", "content": "Keyword: widget 1234"}])
+        self.assertNotIn("Kindle Paperwhite 16GB", json.dumps(call),
+                         "text from Woot listings never reaches the prompt")
+        self.assertEqual(self.claude.client_kwargs[0], {
+            "api_key": self.CLAUDE_KEY, "timeout": main.AUTO_SCREEN_TIMEOUT, "max_retries": 0})
+        self.assertFalse(any(self.CLAUDE_KEY in line for line in logs.output),
+                         "the API key must never be logged")
+
+    # -- failing open --------------------------------------------------------
+
+    def test_a_failed_setup_texts_matches_and_is_retried_later(self):
+        self.claude.answers[self.WIDGET] = RuntimeError("overloaded")
+        self.jev_scores = {"Widget 1234": 0.01}
+        self.gmail.add(f"woot add {self.WIDGET}")
+        line = self.health_line()
+        entry = self.stored_screens()[self.WIDGET]
+        self.assertEqual((entry["status"], entry["attempts"]), ("error", 1))
+        self.assertIn("Widget 1234", self.texted())
+        self.assertIn("status=ok", line)
+        self.assertIn("keyword_screen_failed", line)
+        self.assertIn("not set up yet", self.payloads()[0])
+
+        self.run_check()  # inside the two-hour wait
+        self.assertEqual(len(self.claude.calls), 1)
+
+        screens = self.stored_screens()
+        screens[self.WIDGET]["at"] = (datetime.now(timezone.utc)
+                                      - timedelta(hours=3)).isoformat()
+        self.store[main.KEYWORD_SCREENS_FILENAME] = json.dumps({"screens": screens})
+        del self.claude.answers[self.WIDGET]
+        self.run_check()
+        self.assertEqual(len(self.claude.calls), 2)
+        self.assertEqual(self.stored_screens()[self.WIDGET]["status"], "on")
+        self.assertEqual(self.replies[-1]["To"], main.GMAIL_USER)
+        self.assertIn('Jev screen for "widget 1234": on', self.payloads()[-1])
+
+    def test_retries_back_off_up_to_two_days(self):
+        now = datetime(2026, 10, 8, tzinfo=timezone.utc)
+
+        def due(hours_ago, attempts):
+            return main._retry_due({"status": "error", "attempts": attempts,
+                                    "at": (now - timedelta(hours=hours_ago)).isoformat()}, now)
+
+        self.assertEqual([due(1.9, 1), due(2, 1)], [False, True])
+        self.assertEqual([due(3.9, 2), due(4, 2)], [False, True])
+        self.assertEqual([due(47, 12), due(48, 12)], [False, True])
+
+    def test_without_a_claude_key_nothing_is_described(self):
+        with mock.patch.object(main, "ANTHROPIC_API_KEY", None):
+            self.gmail.add(f"woot add {self.WIDGET}")
+            self.run_check()
+        self.assertEqual(self.claude.calls, [])
+        reply = self.payloads()[0]
+        self.assertIn('Jev screen for "widget 1234": none', reply)
+        self.assertRegex(reply, r"widget 1234\s+not screened")
+
+    def test_a_setup_with_no_time_during_the_commands_happens_at_the_end_of_the_run(self):
+        real = main.set_up_screen
+
+        def short_during_commands(keyword, feed_items, reserve):
+            if reserve == main.COMMANDS_BUDGET_RESERVE:
+                return None
+            return real(keyword, feed_items, reserve)
+
+        with mock.patch.object(main, "set_up_screen", short_during_commands):
+            self.gmail.add(f"woot add {self.WIDGET}")
+            self.run_check()
+        self.assertEqual(len(self.replies), 2)
+        self.assertIn("being set up; the result follows in a separate email", self.payloads()[0])
+        self.assertIn('Jev screen for "widget 1234": on', self.payloads()[1])
+        self.assertEqual(self.replies[1]["To"], main.GMAIL_USER)
+
+    def test_no_budget_means_no_claude_call_and_nothing_stored(self):
+        main._run_deadline = main.time.monotonic() + 60
+        self.addCleanup(main.end_run_budget)
+        self.assertIsNone(main.set_up_screen(self.WIDGET, [], reserve=main.AUTO_SCREEN_END_RESERVE))
+        self.assertEqual(self.claude.calls, [])
+        self.assertNotIn(main.KEYWORD_SCREENS_FILENAME, self.store)
+
+    def test_an_unreadable_screen_file_is_noted_and_left_for_a_person(self):
+        self.store[main.KEYWORD_SCREENS_FILENAME] = "{not json"
+        self.jev_scores = {"Kobo Clara HD": 0.01}
+        self.gmail.add(f"woot add {self.WIDGET}")
+        line = self.health_line()
+        self.assertIn("status=ok", line)
+        self.assertIn("keyword_screens_unreadable", line)
+        self.assertEqual(self.claude.calls, [])
+        self.assertEqual(self.store[main.KEYWORD_SCREENS_FILENAME], "{not json")
+        self.assertIn("Kobo Clara HD", self.set_aside(), "hand-tested screens keep working")
+
+    def test_a_screen_checked_on_another_jev_model_is_described_again(self):
+        self.store_list(self.WIDGET, screens={
+            self.WIDGET: self.screen_on(self.WIDGET, jev_model="jev-0.9.0")})
+        self.jev_scores = {"Widget 1234": 0.01}
+        self.run_check()
+        self.assertIn("Widget 1234", self.texted(), "an unmeasured description decides nothing")
+        self.assertEqual(self.claude.keywords(), [self.WIDGET])
+        self.assertEqual(self.stored_screens()[self.WIDGET]["jev_model"], main.JEV_MODEL)
+
+    # -- the list over time --------------------------------------------------
+
+    def test_keywords_added_before_screens_existed_are_set_up_one_per_run(self):
+        self.store_list(self.WIDGET, "widget 4321")
+        self.run_check()
+        self.assertEqual(self.claude.keywords(), [self.WIDGET])
+        self.assertEqual(self.replies[0]["To"], main.GMAIL_USER)
+        self.assertIn('Jev screen for "widget 1234": on', self.payloads()[0])
+        self.run_check()
+        self.run_check()
+        self.assertEqual(self.claude.keywords(), [self.WIDGET, "widget 4321"],
+                         "hand-tested keywords and montessori are never sent to Claude")
+        self.assertEqual(len(self.replies), 2)
+
+    def test_unscreen_switches_jev_off_for_auto_and_hand_tested_keywords(self):
+        self.store_list(self.WIDGET, screens={self.WIDGET: self.screen_on(self.WIDGET)})
+        self.jev_scores = {"Widget 1234": 0.01, "Kindle Paperwhite 16GB": 0.01}
+        self.gmail.add(f"woot unscreen {self.WIDGET}, Kindle, lego")
+        self.run_check()
+        self.assertIn("Widget 1234", self.texted())
+        self.assertIn("Kindle Paperwhite 16GB", self.texted())
+        self.assertEqual(self.set_aside(), [])
+        screens = self.stored_screens()
+        self.assertEqual((screens[self.WIDGET]["status"], screens["kindle"]["status"]),
+                         ("off", "off"))
+        reply = self.payloads()[0]
+        self.assertIn("Unscreened: widget 1234", reply)
+        self.assertIn("Unscreened: kindle", reply)
+        self.assertIn('Not on the list: "lego"', reply)
+        self.assertRegex(reply, r"kindle\s+not screened")
+        self.assertEqual(self.claude.calls, [])
+
+    def test_removing_a_keyword_forgets_its_screen(self):
+        self.store_list(self.WIDGET, screens={
+            self.WIDGET: self.screen_on(self.WIDGET, status="off", reason="unscreened")})
+        self.gmail.add(f"woot remove {self.WIDGET}")
+        self.run_check()
+        self.assertNotIn(self.WIDGET, self.stored_screens())
+        self.gmail.add(f"woot add {self.WIDGET}")
+        self.run_check()
+        self.assertEqual(self.claude.keywords(), [self.WIDGET])
+        self.assertEqual(self.stored_screens()[self.WIDGET]["status"], "on")
+
+    def test_a_deal_matching_two_screened_keywords_survives_if_either_says_keep(self):
+        main.set_keywords(main.DEFAULT_KEYWORDS + ["lego"])
+        main.set_screens({"lego": self.screen_on("lego")})
+        lego = main._auto_product_id("lego")
+        self.jev_scores = {"LEGO Kindle Stand": {"ereader": 0.01, lego: 0.9},
+                           "LEGO Kindle Sticker": {"ereader": 0.01, lego: 0.05}}
+        to_text, filtered = self.screen(offer("LEGO Kindle Stand"), offer("LEGO Kindle Sticker"))
+        self.assertEqual(self.titles(to_text), ["LEGO Kindle Stand"])
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(set(self.jev_calls[0]["json"]["questions"]),
+                         {f"{q}__{p}" for q in ("wanted", "accessory", "unrelated")
+                          for p in ("ereader", lego)})
 
 
 class NotificationTest(unittest.TestCase):

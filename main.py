@@ -18,6 +18,8 @@ import time
 from flask import Flask, request
 import random
 import html
+import hashlib
+import anthropic
 
 # Set up detailed logging
 logging.basicConfig(
@@ -177,8 +179,8 @@ JEV_ACCESSORY_EXAMPLES = ("a case, cover, sleeve, skin, screen protector, charge
 
 # Which description judges which keyword, keyed by the normalized keyword so
 # "air tag" typed into an email finds the "air-tag" entry. A keyword absent from
-# here is never screened. That includes everything added by email, and
-# "montessori" deliberately: it is a descriptor rather than a product, Jev
+# here gets a description written by Claude instead (below), except
+# "montessori", deliberately: it is a descriptor rather than a product, Jev
 # scored real Montessori shelves as low as 0.11, and the word does not hide
 # inside other words, so there is little to screen out and real deals to lose.
 JEV_KEYWORD_PRODUCT = {normalize_text(k): product for k, product in {
@@ -190,12 +192,100 @@ JEV_KEYWORD_PRODUCT = {normalize_text(k): product for k, product in {
     "macbook air": "macbook_air", "macbook pro": "macbook_pro",
     "3d printer": "printer3d", "3-d printer": "printer3d",
 }.items()}
+NEVER_SCREENED = frozenset({"montessori"})
+
+# --- Jev screens for the other keywords -----------------------------------------
+# Any other keyword gets its description from Claude, once, when it is added.
+# Claude also writes sample listings the user would and would not want, and Jev
+# scores the samples against the description. The screen goes on only if every
+# wanted sample scores at least AUTO_SCREEN_MIN_KEPT, well clear of
+# JEV_DROP_BELOW. That check stands in for the hand-labelled corpus behind the
+# descriptions above. It catches a description too narrow for its own samples,
+# but not a misreading of what the user meant. So the add reply shows Claude's
+# reading and Jev's verdict on the offers live on Woot, and "woot unscreen"
+# turns a screen off.
+#
+# Screens live in their own bucket file because they fail differently from the
+# list. An unreadable keyword list stops the run. An unreadable screen file only
+# means matches are texted unscreened, as before screens existed.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # unset = no new screens
+KEYWORD_SCREENS_FILENAME = "keyword_screens.json"
+AUTO_SCREEN_MODEL = "claude-opus-5-5"
+AUTO_SCREEN_EFFORT = "low"  # a short, well-specified task; it has to fit the run budget
+AUTO_SCREEN_TIMEOUT = 40    # seconds for the Claude call
+AUTO_SCREEN_JEV_SECONDS = 15  # the self-check and live preview, about 20 Jev calls
+AUTO_SCREEN_MIN_KEPT = 0.5
+AUTO_SCREEN_MIN_SAMPLES = 4   # wanted samples needed for the self-check to mean anything
+AUTO_SCREEN_MAX_SAMPLES = 8   # of each kind, to bound the Jev calls
+AUTO_SCREEN_RETRY_HOURS = 2   # after a failed setup; doubles per failure, up to 48
+LIVE_MATCH_LIST_LIMIT = 10    # live offers listed (and previewed) in an add reply
+
+AUTO_SCREEN_INSTRUCTIONS = f"""\
+You are setting up a filter for a personal deal tracker that watches Woot.com.
+
+The user gives the tracker keywords. Whenever a new Woot listing contains a \
+keyword, the user gets a text message. Matching is a plain substring search, \
+case-insensitive, with hyphens read as spaces. So a keyword also matches \
+accessories named after the product ("Case for Kindle Paperwhite") and longer \
+words that happen to contain it ("wardrobe" contains "robe").
+
+Before texting, the tracker asks a judgment model, Jev, about each matching \
+listing: "Is `listing` selling `wanted_product` itself, or a bundle that \
+includes it?" Listings Jev scores below {JEV_DROP_BELOW} are emailed instead of \
+texted. A lost deal is much worse than an extra text, so `wanted_product` must \
+cover everything the user could plausibly want under this keyword.
+
+For the keyword you are given, return:
+
+- screen: false when the keyword does not name a kind of product, so no \
+description could say which matching listings are wanted: a descriptor or style \
+("montessori", "vintage"), a condition ("refurbished"), a store section \
+("clearance"), or a brand that spans unrelated kinds of product. Otherwise true.
+- reading: one short sentence for the user's confirmation email. When screen \
+is true, say in plain words what you take them to want. When false, say why the \
+keyword cannot be screened.
+- wanted_product: the description Jev receives, written like these:
+  "{JEV_PRODUCTS['airtag']}"
+  "{JEV_PRODUCTS['mac_mini']}"
+  "{JEV_PRODUCTS['printer3d']}"
+  Cover every variant, size, model and condition, multi-packs, and bundles that \
+include the product. If the keyword could mean more than one kind of product, \
+cover each of them.
+- accessory_examples: the accessories, parts and consumables sold for this \
+product, as one phrase like "a case, cover, charger, cable, stand or \
+replacement part".
+- keep: 6 listing titles, written the way Woot titles real offers, for \
+products the user wants. Vary them: brand first, refurbished, multi-pack, \
+bundle, and one long, awkward title. Each must contain the keyword.
+- set_aside: 6 listing titles that contain the keyword but are not the \
+product: accessories sold without it, and unrelated products whose names \
+contain the keyword, including inside a longer word. Fewer is fine if few are \
+plausible.
+
+When screen is false, leave wanted_product, accessory_examples and both lists \
+empty."""
+
+AUTO_SCREEN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "screen": {"type": "boolean"},
+        "reading": {"type": "string"},
+        "wanted_product": {"type": "string"},
+        "accessory_examples": {"type": "string"},
+        "keep": {"type": "array", "items": {"type": "string"}},
+        "set_aside": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["screen", "reading", "wanted_product", "accessory_examples",
+                 "keep", "set_aside"],
+    "additionalProperties": False,
+}
 
 KEYWORD_COMMAND_HELP = [
     "To change the list, email this address with one of these as the subject:",
     "  woot add <keyword>, <keyword>, ...",
     "  woot remove <keyword>, <keyword>, ...",
     "  woot list",
+    "  woot unscreen <keyword>   (text every match, skipping Jev)",
 ]
 
 # Rate limiting configuration
@@ -231,6 +321,9 @@ FEED_BUDGET_RESERVE = 45  # keep this much of the budget for the detail fetch
 # Keyword commands run between the feed and the detail fetch, so they leave the
 # detail fetch its reserve plus one slow IMAP round trip.
 COMMANDS_BUDGET_RESERVE = FEED_BUDGET_RESERVE + IMAP_TIMEOUT
+# A Jev screen not set up during the commands is tried at the end of the run,
+# which only needs to send the result email and report health afterwards.
+AUTO_SCREEN_END_RESERVE = IMAP_TIMEOUT + 10
 MAX_FEED_PAGES = 200  # guard against a runaway TotalPages value
 
 # An offer that has not appeared in the feed for this long is dropped from the
@@ -280,6 +373,8 @@ NOTABLE_EVENTS = frozenset({
     "keyword_commands_failed", # inbox unreachable; the current list keeps working
     "keyword_command_rejected",# a command from an unverified sender was ignored
     "jev_unavailable",         # matches were texted unscreened; nothing was lost
+    "keyword_screen_failed",   # a keyword's screen is not set up yet; retried later
+    "keyword_screens_unreadable",  # Claude-described screens off; matches still texted
 })
 
 # The floor has to sit ABOVE the failure it exists to catch: the original
@@ -826,7 +921,55 @@ def save_keywords(keywords):
         return False
 
 
-_COMMAND_RE = re.compile(r"^\s*woot\s+(add|remove|delete|list|help)\b[\s:]*(.*)$",
+def load_keyword_screens():
+    """
+    Load the Jev screens Claude described, keyed by normalized keyword.
+
+    Returns {} when there are none yet, or None if the file exists but cannot
+    be used. Unlike an unreadable keyword list this is not fatal: without
+    screens, matches are texted unscreened, as they were before screens existed.
+    """
+    try:
+        if not storage_client:
+            return None
+        blob = storage_client.bucket(BUCKET_NAME).blob(KEYWORD_SCREENS_FILENAME)
+        if not blob.exists():
+            return {}
+        payload = json.loads(blob.download_as_text())
+        screens = payload.get("screens") if isinstance(payload, dict) else None
+        if not isinstance(screens, dict) or not all(isinstance(e, dict) for e in screens.values()):
+            logging.error(f"'{KEYWORD_SCREENS_FILENAME}' holds no usable screens")
+            return None
+        return screens
+    except Exception as e:
+        logging.error(f"Error loading keyword screens: {e}")
+        return None
+
+
+def save_keyword_screens(screens):
+    """
+    Save the screens. Returns True on success. Refuses after a failed read, so
+    a damaged file is left for a person to look at rather than overwritten.
+    """
+    if not _screens_writable:
+        return False
+    try:
+        if not storage_client:
+            return False
+        blob = storage_client.bucket(BUCKET_NAME).blob(KEYWORD_SCREENS_FILENAME)
+        blob.upload_from_string(
+            json.dumps({"version": 1, "screens": screens,
+                        "updated": datetime.now(timezone.utc).isoformat()}, indent=1),
+            content_type="application/json",
+        )
+        return True
+    except Exception as e:
+        logging.error(f"Error saving keyword screens: {e}")
+        logging.error(traceback.format_exc())
+        return False
+
+
+_COMMAND_RE = re.compile(r"^\s*woot\s+(add|remove|delete|list|help|unscreen)\b[\s:]*(.*)$",
                          re.IGNORECASE | re.DOTALL)
 
 # Letters, digits and a little punctuation. Besides rejecting nonsense this
@@ -933,9 +1076,9 @@ def apply_keyword_command(action, args, keywords, feed_items):
                 lines.append(f"  {len(live)} offers on Woot match it right now. They were "
                              f"already seen, so they will not alert; only new listings will:")
                 lines += [f"  - {i.get('Title') or '(no title)'}  {i.get('Url') or ''}".rstrip()
-                          for i in live[:10]]
-                if len(live) > 10:
-                    lines.append(f"  ...and {len(live) - 10} more")
+                          for i in live[:LIVE_MATCH_LIST_LIMIT]]
+                if len(live) > LIVE_MATCH_LIST_LIMIT:
+                    lines.append(f"  ...and {len(live) - LIVE_MATCH_LIST_LIMIT} more")
             else:
                 lines.append("  Nothing on Woot matches it right now.")
 
@@ -962,6 +1105,48 @@ def apply_keyword_command(action, args, keywords, feed_items):
         lines.append("No changes.")
 
     return updated, lines
+
+
+def apply_unscreen(args, keywords):
+    """
+    Switch Jev off for keywords on the list, so every match is texted.
+    Returns (screens, report_lines); screens is a changed copy.
+    """
+    screens = dict(_screens)
+    lines = []
+    if not args:
+        lines.append('Nothing to unscreen. Put the keyword after "woot unscreen".')
+    on_list = {normalize_text(k): k for k in keywords}
+    for raw in args:
+        norm = normalize_text(" ".join(raw.strip().strip("\"'").split()))
+        keyword = on_list.get(norm)
+        if keyword is None:
+            lines.append(f'Not on the list: "{_printable(raw)}"')
+        elif not _screens_writable:
+            lines.append(f'Not unscreened "{keyword}": the screen file could not be read. '
+                         f"Try again later.")
+        elif norm in NEVER_SCREENED or (screens.get(norm) or {}).get("status") == "off":
+            lines.append(f"Already unscreened: {keyword}")
+        else:
+            screens[norm] = {"status": "off", "keyword": keyword,
+                             "reason": 'you sent "woot unscreen"',
+                             "at": datetime.now(timezone.utc).isoformat()}
+            lines.append(f"Unscreened: {keyword}. Every match for it will be texted. "
+                         f"To screen it again, remove it and add it back.")
+    return screens, lines
+
+
+def forget_screens(keywords):
+    """
+    Drop the screens of removed keywords, so one added back is described
+    afresh. Best effort: a stale entry only matters if the keyword returns.
+    """
+    norms = {normalize_text(k) for k in keywords}
+    if not norms & set(_screens):
+        return
+    screens = {k: e for k, e in _screens.items() if k not in norms}
+    if save_keyword_screens(screens):
+        set_screens(screens)
 
 
 def _gmail_dmarc_pass(raw_headers, sender):
@@ -1044,8 +1229,13 @@ def verified_command_sender(msg, labels, raw_headers):
 
 def _send_keyword_reply(to, lines, keywords):
     """Tell the sender what their command did. Best effort."""
+    if TYPESAFE_API_KEY:
+        width = max((len(k) for k in keywords), default=0)
+        listed = [f"  {k.ljust(width)}  {screen_status(k)}" for k in keywords]
+    else:
+        listed = [f"  {k}" for k in keywords]
     body = "\n".join(
-        lines + ["", f"Keyword list ({len(keywords)}):"] + [f"  {k}" for k in keywords]
+        lines + ["", f"Keyword list ({len(keywords)}):"] + listed
         + [""] + KEYWORD_COMMAND_HELP)
     # The subject must not look like a command, or a reply to the tracker's own
     # address would be read back in as one.
@@ -1079,7 +1269,7 @@ def _process_mailbox(imap, feed_items):
     # Gmail's own search narrows this to likely commands. It is only a first
     # pass; parse_keyword_command decides, and anything it rejects is left
     # completely untouched -- this is a personal inbox.
-    query = (f"subject:(woot (add OR remove OR delete OR list OR help)) "
+    query = (f"subject:(woot (add OR remove OR delete OR list OR help OR unscreen)) "
              f"newer_than:{COMMAND_LOOKBACK_DAYS}d -label:{COMMAND_LABEL}")
     data = _imap_ok(imap.uid("SEARCH", "X-GM-RAW", f'"{query}"'), "search")
     uids = (data[0] or b"").split() if data else []
@@ -1124,13 +1314,28 @@ def _process_mailbox(imap, feed_items):
             continue
 
         action, args = command
-        updated, lines = apply_keyword_command(action, args, keywords, feed_items)
-        if updated != keywords:
-            if not save_keywords(updated):
-                # Leave the email unlabelled so the next run applies it again.
-                raise RuntimeError("could not save the keyword list")
-            keywords = updated
-            set_keywords(keywords)
+        if action == "unscreen":
+            screens, lines = apply_unscreen(args, keywords)
+            if screens != _screens:
+                if not save_keyword_screens(screens):
+                    raise RuntimeError("could not save the keyword screens")
+                set_screens(screens)
+        else:
+            updated, lines = apply_keyword_command(action, args, keywords, feed_items)
+            if updated != keywords:
+                if not save_keywords(updated):
+                    # Leave the email unlabelled so the next run applies it again.
+                    raise RuntimeError("could not save the keyword list")
+                added = [k for k in updated if k not in keywords]
+                forget_screens([k for k in keywords if k not in updated])
+                keywords = updated
+                set_keywords(keywords)
+                # Uses part of the run budget; commands left over wait for the
+                # next run, as they do when the inbox is slow.
+                for keyword in added:
+                    screen_lines = screen_lines_for_added(keyword, feed_items)
+                    if screen_lines:
+                        lines += [""] + screen_lines
         logging.info(f"Keyword command '{action}' with {len(args)} argument(s) applied; "
                      f"the list now holds {len(keywords)} keywords")
 
@@ -2059,22 +2264,92 @@ def _plain_text(value, limit):
     return text[:limit]
 
 
+# keyword_screens.json, keyed by normalized keyword. An entry's status is "on"
+# (Claude's description passed the self-check), "off" (no screen: the user sent
+# "woot unscreen", Claude found no product to describe, or the self-check
+# failed) or "error" (setup failed; retried later). No entry means not set up yet.
+_screens = {}
+_screens_writable = True  # False after a failed read, so nothing overwrites the file
+
+
+def set_screens(screens):
+    """Make `screens` the live set. None means the file could not be read."""
+    global _screens, _screens_writable
+    _screens_writable = screens is not None
+    _screens = dict(screens or {})
+
+
+def _auto_product_id(norm_keyword):
+    """A stable Jev question key for a keyword's own description."""
+    slug = re.sub(r"[^a-z0-9]+", "_", norm_keyword).strip("_")[:30]
+    return f"kw_{slug}_{hashlib.sha1(norm_keyword.encode()).hexdigest()[:6]}"
+
+
+def _jev_spec(norm_keyword):
+    """
+    (product, wanted_product, accessory examples) for a keyword, or None when
+    Jev does not judge it.
+
+    A Claude-written description is used only while it is "on" and was checked
+    against the Jev model in use: a model change invalidates the check, just as
+    it would the threshold measured for the descriptions above.
+    """
+    entry = _screens.get(norm_keyword) or {}
+    if entry.get("status") == "off":
+        return None
+    product = JEV_KEYWORD_PRODUCT.get(norm_keyword)
+    if product:
+        return product, JEV_PRODUCTS[product], JEV_ACCESSORY_EXAMPLES
+    wanted, accessories = entry.get("wanted_product"), entry.get("accessory_examples")
+    if (entry.get("status") == "on" and entry.get("jev_model") == JEV_MODEL
+            and isinstance(wanted, str) and wanted and isinstance(accessories, str)):
+        return _auto_product_id(norm_keyword), wanted, accessories
+    return None
+
+
+def _needs_screen(norm_keyword):
+    """Whether a keyword is waiting for Claude to describe it (or describe it again)."""
+    if not (TYPESAFE_API_KEY and ANTHROPIC_API_KEY and _screens_writable):
+        return False
+    if norm_keyword in JEV_KEYWORD_PRODUCT or norm_keyword in NEVER_SCREENED:
+        return False
+    entry = _screens.get(norm_keyword) or {}
+    if entry.get("status") == "off":
+        return False
+    if entry.get("status") == "on":
+        return _jev_spec(norm_keyword) is None  # checked on another Jev model, or damaged
+    return True  # never set up, or failed (_retry_due decides when to try again)
+
+
+def screen_status(keyword):
+    """How a keyword is screened, in words for the reply email."""
+    norm = normalize_text(keyword)
+    if TYPESAFE_API_KEY and _jev_spec(norm) is not None:
+        return "screened" if norm in JEV_KEYWORD_PRODUCT else "screened (auto)"
+    return "screen pending" if _needs_screen(norm) else "not screened"
+
+
 def _jev_products_for(deal):
     """
-    The Jev product descriptions for the keywords this deal matched.
+    {product: (wanted_product, accessory examples)} for the keywords this deal
+    matched.
 
-    None means "do not judge it": either a matched keyword has no tested
-    description (Montessori, or anything added by email), or nothing matched.
-    Such a deal is always texted -- one keyword Jev cannot judge is enough to
-    vouch for it.
+    None means "do not judge it": a matched keyword has no screen (Montessori,
+    one switched off, or one not set up yet), or nothing matched. Such a deal
+    is always texted -- one keyword Jev cannot judge is enough to vouch for it.
     """
     keywords = set()
     for field in DEAL_MATCH_FIELDS:
         keywords.update(matched_keywords(deal.get(field)))
-    products = {JEV_KEYWORD_PRODUCT.get(normalize_text(k)) for k in keywords}
-    if not keywords or None in products:
+    if not keywords:
         return None
-    return sorted(products)
+    specs = {}
+    for keyword in keywords:
+        spec = _jev_spec(normalize_text(keyword))
+        if spec is None:
+            return None
+        specs[spec[0]] = spec[1:]
+    return dict(sorted(specs.items()))
 
 
 def _jev_questions(products):
@@ -2084,8 +2359,7 @@ def _jev_questions(products):
     measured with; the accessory score also explains a drop in the email.
     """
     questions = {}
-    for product in products:
-        wanted = JEV_PRODUCTS[product]
+    for product, (wanted, accessory_examples) in products.items():
         questions[f"wanted__{product}"] = {
             "type": "noul",
             "instructions": {
@@ -2106,7 +2380,7 @@ def _jev_questions(products):
             "instructions": {
                 "wanted_product": wanted,
                 "question": "Is `listing` an accessory, consumable or part for "
-                            f"`wanted_product` ({JEV_ACCESSORY_EXAMPLES}), sold "
+                            f"`wanted_product` ({accessory_examples}), sold "
                             "without the product itself?",
             },
         }
@@ -2188,8 +2462,8 @@ def screen_matches(deals, feed_items):
     a keyword. They are still emailed, never silently dropped.
 
     Fails open everywhere: with no API key, on any error or timeout, once the
-    run budget is short, or for a keyword Jev has no tested description for,
-    the deal is texted exactly as it would have been without this filter.
+    run budget is short, or for a keyword that has no screen, the deal is
+    texted exactly as it would have been without this filter.
     """
     if not TYPESAFE_API_KEY or not deals:
         return list(deals), []
@@ -2229,6 +2503,216 @@ def screen_matches(deals, feed_items):
                             f"Jev could not judge {failures} of {len(deals)} matches; "
                             f"they were texted unfiltered")
     return to_text, filtered
+
+
+def _describe_keyword(keyword):
+    """
+    Ask Claude what `keyword` is after. Returns the cleaned answer; raises on
+    any failure, including an answer with too few usable samples to check.
+    """
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=AUTO_SCREEN_TIMEOUT,
+                                 max_retries=0)  # a failed setup is retried by a later run
+    response = client.beta.messages.create(
+        model=AUTO_SCREEN_MODEL,
+        max_tokens=8000,
+        system=AUTO_SCREEN_INSTRUCTIONS,
+        messages=[{"role": "user", "content": f"Keyword: {keyword}"}],
+        output_config={"effort": AUTO_SCREEN_EFFORT,
+                       "format": {"type": "json_schema", "schema": AUTO_SCREEN_SCHEMA}},
+        # If a safety classifier declines, the API reruns the request on the
+        # model Anthropic recommends instead of returning the refusal.
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
+    )
+    if response.stop_reason != "end_turn":
+        raise RuntimeError(f"Claude stopped early ({response.stop_reason})")
+    answer = json.loads(next(b.text for b in response.content if b.type == "text"))
+
+    norm = normalize_text(keyword)
+
+    def samples(name, exclude=()):
+        # A sample without the keyword in it could never reach the screen.
+        titles = []
+        for raw in answer.get(name) or []:
+            title = _printable(" ".join(str(raw).split()), 160)
+            if norm in normalize_text(title) and title not in titles and title not in exclude:
+                titles.append(title)
+        return titles[:AUTO_SCREEN_MAX_SAMPLES]
+
+    keep = samples("keep")
+    cleaned = {
+        "screen": answer.get("screen") is True,
+        "reading": _printable(" ".join(str(answer.get("reading") or "").split()), 300),
+        "wanted_product": _printable(" ".join(str(answer.get("wanted_product") or "").split()), 800),
+        "accessory_examples": _printable(
+            " ".join(str(answer.get("accessory_examples") or "").split()), 300),
+        "keep": keep,
+        "set_aside": samples("set_aside", exclude=keep),
+    }
+    if cleaned["screen"]:
+        if not cleaned["wanted_product"]:
+            raise ValueError("Claude returned no product description")
+        if len(keep) < AUTO_SCREEN_MIN_SAMPLES:
+            raise ValueError(f"Claude returned {len(keep)} usable sample listings, "
+                             f"fewer than the {AUTO_SCREEN_MIN_SAMPLES} the check needs")
+        if not cleaned["accessory_examples"]:
+            cleaned["accessory_examples"] = "a case, cover, charger, cable, stand or replacement part"
+    return cleaned
+
+
+def _jev_wanted(state, product, spec):
+    """Jev's `wanted` score for one listing against one description. Raises on failure."""
+    return _jev_scores(state, {product: spec})[product]["wanted"]
+
+
+def set_up_screen(keyword, feed_items, reserve):
+    """
+    Describe `keyword` with Claude, check the description with Jev, store the
+    result, and preview it on the live offers that match the keyword.
+
+    Returns (entry, report_lines), or None when the run has too little budget
+    left to try: then nothing is spent or stored and the keyword stays pending.
+    `reserve` is the budget the caller still needs afterwards.
+    """
+    if budget_remaining() < reserve + AUTO_SCREEN_TIMEOUT + AUTO_SCREEN_JEV_SECONDS:
+        return None
+
+    norm = normalize_text(keyword)
+    product = _auto_product_id(norm)
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        answer = _describe_keyword(keyword)
+        if not answer["screen"]:
+            entry = {"status": "off", "keyword": keyword,
+                     "reason": answer["reading"] or "Claude found no one kind of product to describe",
+                     "model": AUTO_SCREEN_MODEL, "at": now}
+        else:
+            spec = (answer["wanted_product"], answer["accessory_examples"])
+            check = {}
+            for kind in ("keep", "set_aside"):
+                check[kind] = {}
+                for title in answer[kind]:
+                    if budget_remaining() < reserve + JEV_TIMEOUT:
+                        raise RuntimeError("the run budget ran out during the self-check")
+                    check[kind][title] = _jev_wanted({"listing": {"title": title}}, product, spec)
+            entry = {"status": "on", "keyword": keyword, "reading": answer["reading"],
+                     "wanted_product": spec[0], "accessory_examples": spec[1],
+                     "check": check, "model": AUTO_SCREEN_MODEL, "jev_model": JEV_MODEL,
+                     "at": now}
+            title, lowest = min(check["keep"].items(), key=lambda kv: kv[1])
+            if lowest < AUTO_SCREEN_MIN_KEPT:
+                entry["status"] = "off"
+                entry["reason"] = (f'in a self-check Jev scored "{title}", a listing it '
+                                   f"should keep, only {lowest:.2f}, too close to setting "
+                                   f"real deals aside")
+    except Exception as e:
+        previous = _screens.get(norm) or {}
+        attempts = previous.get("attempts", 0) + 1 if previous.get("status") == "error" else 1
+        reason = _printable(f"{type(e).__name__}: {e}", 200)
+        entry = {"status": "error", "keyword": keyword, "reason": reason,
+                 "attempts": attempts, "at": now}
+        logging.warning(f"Could not set up a Jev screen for '{keyword}': {reason}")
+        record_health_event("keyword_screen_failed",
+                            f"no Jev screen yet for '{keyword}' (attempt {attempts}); "
+                            f"its matches are texted unscreened")
+
+    screens = dict(_screens)
+    screens[norm] = entry
+    if not save_keyword_screens(screens):
+        logging.error(f"Could not save the Jev screen for '{keyword}'; it applies to this run only")
+    set_screens(screens)
+    logging.info(f"Jev screen for '{keyword}': {entry['status']}")
+
+    # The preview only informs the reply; it decides nothing.
+    preview = []
+    if entry["status"] == "on":
+        spec = (entry["wanted_product"], entry["accessory_examples"])
+        for item in items_mentioning(keyword, feed_items)[:LIVE_MATCH_LIST_LIMIT]:
+            if budget_remaining() < reserve + JEV_TIMEOUT:
+                break
+            try:
+                preview.append((item.get("Title") or "(no title)",
+                                _jev_wanted(_jev_state(item, item), product, spec)))
+            except Exception as e:
+                logging.warning(f"Jev could not preview an offer for '{keyword}': {e}")
+    return entry, _screen_report(keyword, entry, preview)
+
+
+def _screen_report(keyword, entry, preview=()):
+    """The reply-email lines describing one keyword's screen."""
+    if entry["status"] == "on":
+        keep = list(entry["check"]["keep"].values())
+        aside = list(entry["check"]["set_aside"].values())
+        caught = sum(1 for s in aside if s < JEV_DROP_BELOW)
+        lines = [f'Jev screen for "{keyword}": on',
+                 f"  Reading: {entry['reading'] or entry['wanted_product']}",
+                 f"  Self-check: the lowest of {len(keep)} listings it should keep scored "
+                 f"{min(keep):.2f} (needs {AUTO_SCREEN_MIN_KEPT}); it set aside {caught} of "
+                 f"{len(aside)} look-alikes."]
+        if preview:
+            lines.append("  Its verdict on the offers on Woot that match it right now:")
+            lines += [f"    {'keep     ' if w >= JEV_DROP_BELOW else 'set aside'}  {w:.2f}  "
+                      f"{_printable(title, 80)}" for title, w in preview]
+        lines += ["  Set-aside matches are still emailed, just not texted. If the reading is",
+                  f'  wrong, send "woot unscreen {keyword}" and every match will be texted.']
+        return lines
+    if entry["status"] == "off":
+        return [f'Jev screen for "{keyword}": off, so every match will be texted.',
+                f"  Why: {entry['reason']}"]
+    return [f'Jev screen for "{keyword}": not set up yet; every match is texted until it is.',
+            f"  Why: {entry['reason']}. It is retried automatically."]
+
+
+def screen_lines_for_added(keyword, feed_items):
+    """Set up a screen for a keyword just added by email. Returns the reply lines."""
+    norm = normalize_text(keyword)
+    if not TYPESAFE_API_KEY:
+        return []
+    if norm in JEV_KEYWORD_PRODUCT:
+        return [f'Jev screen for "{keyword}": on, with a hand-tested description.']
+    if not _needs_screen(norm):
+        return [f'Jev screen for "{keyword}": none, so every match will be texted.']
+    result = set_up_screen(keyword, feed_items, reserve=COMMANDS_BUDGET_RESERVE)
+    if result is None:
+        return [f'Jev screen for "{keyword}": being set up; the result follows in a '
+                f"separate email, usually within the hour."]
+    return result[1]
+
+
+def _retry_due(entry, now):
+    """Whether a failed setup has waited long enough to try again."""
+    if not entry or entry.get("status") != "error":
+        return True
+    try:
+        failed_at = datetime.fromisoformat(entry["at"])
+    except (KeyError, TypeError, ValueError):
+        return True
+    hours = min(AUTO_SCREEN_RETRY_HOURS * 2 ** (entry.get("attempts", 1) - 1), 48)
+    return now >= failed_at + timedelta(hours=hours)
+
+
+def set_up_pending_screen(feed_items):
+    """
+    Set up at most one screen still missing: for a keyword added when the run
+    had no time to spare, one whose setup failed earlier, one checked against
+    an older Jev model, or one added before screens existed. Emails the owner
+    once it is settled. Never raises.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        for keyword in _keywords:
+            norm = normalize_text(keyword)
+            if not (_needs_screen(norm) and _retry_due(_screens.get(norm), now)):
+                continue
+            result = set_up_screen(keyword, feed_items, reserve=AUTO_SCREEN_END_RESERVE)
+            # A failure is not mailed: it is retried, and noted in the health line.
+            if result and result[0]["status"] != "error":
+                _send_keyword_reply(GMAIL_USER, result[1], _keywords)
+            return
+    except Exception as e:
+        logging.error(f"Setting up a pending Jev screen failed: {e}")
+        logging.error(traceback.format_exc())
+        record_health_event("keyword_screen_failed", repr(e)[:200])
 
 
 DEAL_MATCH_FIELDS = ("Title", "Subtitle", "WriteUpBody", "Features", "Snippet", "Slug")
@@ -2592,6 +3076,12 @@ def _run_deal_check():
         report_run_health("failed", metrics)
         return "Error: could not read the keyword list", 503
     set_keywords(keywords)
+    screens = load_keyword_screens()
+    if screens is None:
+        record_health_event("keyword_screens_unreadable",
+                            f"could not read {KEYWORD_SCREENS_FILENAME}; matches for "
+                            f"keywords Claude described are texted unscreened")
+    set_screens(screens)
 
     # Step 1: fetch the feed
     global _feed_was_fetched
@@ -2751,6 +3241,10 @@ def _run_deal_check():
                 f"{unpruned} entries are older than the "
                 f"{SEEN_DEALS_RETENTION_DAYS}-day retention but survived the prune"
             )
+
+    # Step 6: with whatever budget is left, set up one Jev screen still missing.
+    # Last, so it only spends time this run's own work did not need.
+    set_up_pending_screen(feed_items)
 
     metrics["duration_s"] = round(RUN_BUDGET_SECONDS - budget_remaining(), 1)
     if metrics["duration_s"] > RUN_BUDGET_SECONDS * RUN_DURATION_WARN_RATIO:

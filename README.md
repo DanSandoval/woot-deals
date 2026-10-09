@@ -24,6 +24,7 @@ This service:
 - `test_api_endpoints.py` - Script to test Woot API connectivity
 - `test_pipeline.py` - Offline tests for the deal-checking pipeline (no credentials needed)
 - `test_jev_live.py` - Live check of the Jev screen against labelled listings (needs `TYPESAFE_API_KEY`)
+- `test_auto_screen_live.py` - Live check of the screens Claude writes for emailed keywords (needs `TYPESAFE_API_KEY` and `ANTHROPIC_API_KEY`)
 - `testdata/jev_corpus.json` - 120 labelled listings: 49 live Woot offers and 71 hard cases
 
 ## Setup Instructions
@@ -94,6 +95,17 @@ wanted listing would be set aside:
 python test_jev_live.py
 ```
 
+To check the screens Claude writes for keywords added by email (skipped
+without both `TYPESAFE_API_KEY` and `ANTHROPIC_API_KEY`; about $0.10 a run).
+Run it before changing `AUTO_SCREEN_MODEL`, `AUTO_SCREEN_EFFORT`,
+`AUTO_SCREEN_INSTRUCTIONS` or `AUTO_SCREEN_MIN_KEPT` - it fails if a description
+fails its own self-check, if Claude answers too slowly for the run budget, or
+if a wanted listing would be set aside:
+
+```
+python test_auto_screen_live.py
+```
+
 To test only the API connectivity:
 
 ```
@@ -113,11 +125,13 @@ subject line:
 | `woot add lego, switch 2` | add one or more keywords |
 | `woot remove kindle` | remove one or more (`delete` works too) |
 | `woot list` | change nothing, just reply with the list |
+| `woot unscreen robe` | turn the Jev screen off for a keyword, so every match is texted |
 
 Each run (every 30 minutes) applies waiting commands before matching, so a new
 keyword already catches new listings in that run. The reply lists the result, the
-whole list, and the offers on Woot that match a new keyword right now. Those were
-already seen and will not alert; only listings that appear later do.
+whole list with how each keyword is screened, and the offers on Woot that match a
+new keyword right now. Those were already seen and will not alert; only listings
+that appear later do.
 
 Rules:
 - Only the owner can change the list. Mail sent from `GMAIL_USER` to itself is
@@ -142,18 +156,50 @@ means. If Jev scores it below `JEV_DROP_BELOW` (0.2) for every product it
 matched, it is listed in the email under "Filtered out" and not texted. It is
 still recorded as seen.
 
-- Measured 2026-09-27 on the labelled corpus: no wanted listing set aside, every
+- Keywords in `JEV_KEYWORD_PRODUCT` use hand-written descriptions. Measured
+  2026-09-27 on the labelled corpus: no wanted listing set aside, every
   accessory and look-alike set aside outside Montessori.
-- Only keywords in `JEV_KEYWORD_PRODUCT` are screened. `montessori` is left out
-  on purpose (Jev scored real Montessori shelves as low as 0.11), and keywords
-  added by email are never screened, because an untested description could
-  drop real deals.
+- `montessori` is never screened, on purpose (Jev scored real Montessori
+  shelves as low as 0.11).
+- A deal that matches any unscreened keyword is texted, even if it also
+  matched a screened one.
 - It fails open. With no `TYPESAFE_API_KEY`, on any error or timeout, or when
   the run is short on time, matches are texted exactly as before, and
   `jev_unavailable` is noted.
 - Production needs its own TypeSafe key (create one at
   https://console.typesafe.ai/keys), set as the Cloud Run env var
   `TYPESAFE_API_KEY`. Do not reuse a development key.
+
+#### Screens for keywords added by email
+
+Every other keyword gets its description from Claude (`AUTO_SCREEN_MODEL`)
+once, when it is added:
+
+1. Claude gets the keyword only - never text from Woot listings - and returns a
+   one-line reading for the user, the description Jev receives, the
+   accessories sold for the product, and sample listings to keep and to set
+   aside. If the keyword names no kind of product (a style, a condition, a
+   brand spanning unrelated things), the screen stays off.
+2. Jev scores the samples. The screen goes on only if every sample to keep
+   scores at least `AUTO_SCREEN_MIN_KEPT` (0.5), well clear of the 0.2 cutoff.
+   That catches a description too narrow for its own samples, not a misreading
+   of what you meant.
+3. The add reply shows the reading, the self-check, and Jev's verdict on the
+   offers live on Woot right now, so a misreading is visible at once. `woot
+   unscreen <keyword>` turns it off; remove and re-add a keyword to describe it
+   afresh.
+
+Results live in `keyword_screens.json` in the bucket. Setup runs during the
+command if the run has time. Otherwise it runs at the end of the run (or a
+later one) and the result arrives in a separate email. A failed setup leaves
+the keyword unscreened, notes `keyword_screen_failed`, and is retried after 2
+hours, doubling up to 48. Keywords that were on the list before screens existed
+are set up one per run. A screen checked against a different `JEV_MODEL` is
+described again. Without `ANTHROPIC_API_KEY` nothing new is screened.
+
+Production needs its own Anthropic API key, set as the Cloud Run env var
+`ANTHROPIC_API_KEY`; give it a monthly spend limit in the Claude Console. Each
+setup is one Claude call, about 5 cents.
 
 ## Monitoring
 
@@ -238,6 +284,8 @@ Notable - context for whoever is already looking, listed in `NOTABLE_EVENTS`:
 | `keyword_commands_failed` | the inbox could not be read or a change not saved; the current list keeps working |
 | `keyword_command_rejected` | a command from an unverified sender was ignored |
 | `jev_unavailable` | Jev could not judge some matches; they were texted unscreened |
+| `keyword_screen_failed` | Claude or Jev failed while setting up a keyword's screen; its matches are texted until a retry works |
+| `keyword_screens_unreadable` | `keyword_screens.json` could not be read; Claude-described screens are off and the file is left untouched for a person to fix |
 
 An event kind that is not named in `NOTABLE_EVENTS` pages. That default is
 deliberate: forgetting to classify a new check should over-alert, never
