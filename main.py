@@ -349,6 +349,12 @@ HEALTH_STATE_FILENAME = "health_state.json"
 # which is the only way to catch the service not running at all.
 HEALTH_MARKER = "WOOT_HEALTH"
 
+# A second line per run, kept apart from health because nothing alerts on it:
+# how long the offers this run saw for the first time had been up, and how many
+# were already sold out. It answers whether running more often would catch deals
+# the schedule misses, from data every run already fetches.
+TIMING_MARKER = "WOOT_TIMING"
+
 # Not everything worth recording is worth interrupting someone for. Every check
 # below used to escalate the run to "degraded", which is what the paging metric
 # counts, so twenty-odd conditions ranging from "the service is down" to "a Woot
@@ -3183,6 +3189,7 @@ def _run_deal_check():
     # spent on plausible matches.
     feed_ids = []
     potential_matches = []
+    new_items = []
     already_seen = 0
 
     for item in feed_items:
@@ -3196,6 +3203,7 @@ def _run_deal_check():
             already_seen += 1
             continue
 
+        new_items.append(item)
         if improved_title_contains_keywords(item):
             potential_matches.append(offer_id)
 
@@ -3213,6 +3221,12 @@ def _run_deal_check():
         f"Pre-filtered {len(feed_items)} feed items: {already_seen} already seen, "
         f"{metrics['new_items']} new, {len(potential_matches)} potential matches"
     )
+    # Observe-only, so it must never be able to break the run.
+    try:
+        timing = offer_timing(feed_items, new_items, datetime.now(timezone.utc))
+        logging.info(f"{TIMING_MARKER} " + " ".join(f"{k}={v}" for k, v in timing.items()))
+    except Exception as e:
+        logging.warning(f"Could not measure offer timing: {e}")
 
     # Step 3: pull full details for the potential matches and confirm them
     matching_deals = []
@@ -3461,6 +3475,78 @@ def check_feed_health(feed_items, feed_ids, items, feed_complete):
             "feed_shrank",
             f"{feed_items} items against a recent median of {baseline}"
         )
+
+
+def _woot_time(value):
+    """A feed date as an aware datetime, or None. Woot sends UTC with an offset."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    # A date without an offset is not guessed at: Woot's events turn over at
+    # midnight Central, so reading it as UTC could be hours wrong.
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _percentile(values, fraction):
+    """The value `fraction` of the way through a non-empty list, sorted."""
+    ordered = sorted(values)
+    return ordered[round(fraction * (len(ordered) - 1))]
+
+
+def offer_timing(feed_items, new_items, now):
+    """
+    How late this run saw its new offers, and how fast offers sell out.
+
+    For offers seen for the first time: how many minutes they had been up, and
+    how many were already sold out -- deals this schedule was too slow for. For
+    the whole catalogue: the share sold out and how long offers are scheduled to
+    run. An offer without a usable StartDate is counted, not guessed at.
+    """
+    ages, sold_out_ages = [], []
+    new_sold_out = not_started = undated = 0
+    for item in new_items:
+        is_sold_out = item.get("IsSoldOut") is True
+        new_sold_out += is_sold_out
+        start = _woot_time(item.get("StartDate"))
+        if start is None:
+            undated += 1
+        elif start > now:
+            not_started += 1
+        else:
+            age = (now - start).total_seconds() / 60
+            ages.append(age)
+            if is_sold_out:
+                sold_out_ages.append(age)
+
+    sold_out = 0
+    lifespans = []
+    for item in feed_items:
+        sold_out += item.get("IsSoldOut") is True
+        start = _woot_time(item.get("StartDate"))
+        end = _woot_time(item.get("EndDate"))
+        if start and end and end > start:
+            lifespans.append((end - start).total_seconds() / 3600)
+
+    timing = {
+        "new": len(new_items),
+        "new_sold_out": new_sold_out,
+        "new_not_started": not_started,
+        "new_undated": undated,
+        "sold_out": f"{sold_out}/{len(feed_items)}",
+    }
+    if ages:
+        timing["new_age_min_p50"] = round(_percentile(ages, 0.5))
+        timing["new_age_min_p90"] = round(_percentile(ages, 0.9))
+        timing["new_age_min_max"] = round(max(ages))
+    if sold_out_ages:
+        timing["new_sold_out_age_min_p50"] = round(_percentile(sold_out_ages, 0.5))
+    if lifespans:
+        timing["lifespan_h_p10"] = round(_percentile(lifespans, 0.1), 1)
+        timing["lifespan_h_p50"] = round(_percentile(lifespans, 0.5), 1)
+    return timing
 
 
 def count_canary_hits(items):

@@ -1052,6 +1052,63 @@ class QuotaProjectionTest(unittest.TestCase):
             {"run_starts": [(now - timedelta(seconds=30)).isoformat()]}, now))
 
 
+class OfferTimingTest(PipelineTestBase):
+    """How late each run sees new offers, and how fast offers sell out."""
+
+    NOW = datetime(2026, 10, 9, 16, 0, tzinfo=timezone.utc)
+
+    @staticmethod
+    def dated(start, end=None, sold_out=False):
+        return {"StartDate": start, "EndDate": end, "IsSoldOut": sold_out}
+
+    def test_new_offers_are_aged_from_their_start_date(self):
+        new = [
+            self.dated("2026-10-09T15:50:00+00:00", "2026-10-10T15:50:00+00:00"),
+            self.dated("2026-10-09T15:40:00+00:00", sold_out=True),
+            self.dated("2026-10-09T15:00:00Z", "2026-10-10T03:00:00Z"),
+            # Listed ahead of its start.
+            self.dated("2026-10-09T17:00:00+00:00"),
+            # No offset: reading it as UTC could be hours wrong, so it is not used.
+            self.dated("2026-10-09T15:30:00"),
+            self.dated(None),
+        ]
+        old = [self.dated("2026-10-08T05:00:00+00:00", "2026-10-10T05:00:00+00:00",
+                          sold_out=True)]
+        timing = main.offer_timing(new + old, new, self.NOW)
+
+        self.assertEqual(timing["new"], 6)
+        self.assertEqual(timing["new_sold_out"], 1)
+        self.assertEqual(timing["new_not_started"], 1)
+        self.assertEqual(timing["new_undated"], 2)
+        self.assertEqual((timing["new_age_min_p50"], timing["new_age_min_p90"],
+                          timing["new_age_min_max"]), (20, 60, 60))
+        self.assertEqual(timing["new_sold_out_age_min_p50"], 20)
+        self.assertEqual(timing["sold_out"], "2/7")
+        # Scheduled lengths 12h, 24h and 48h.
+        self.assertEqual((timing["lifespan_h_p10"], timing["lifespan_h_p50"]), (12.0, 24.0))
+
+    def test_offers_without_dates_leave_the_ages_out(self):
+        timing = main.offer_timing([{"IsSoldOut": "yes"}], [{"StartDate": 5}], self.NOW)
+        self.assertEqual(timing, {"new": 1, "new_sold_out": 0, "new_not_started": 0,
+                                  "new_undated": 1, "sold_out": "0/1"})
+
+    def test_each_run_logs_its_timing_line(self):
+        with self.assertLogs(level="INFO") as captured:
+            self.run_check()
+        messages = [r.getMessage() for r in captured.records]
+        timing = [m for m in messages if m.startswith(main.TIMING_MARKER + " ")]
+        health = [m for m in messages if m.startswith(main.HEALTH_MARKER + " ")]
+        self.assertEqual(len(timing), 1)
+        new_items = health[0].split("new_items=")[1].split(" ")[0]
+        self.assertIn(f" new={new_items} ", timing[0])
+
+    def test_a_timing_failure_does_not_break_the_run(self):
+        with mock.patch.object(main, "offer_timing", side_effect=RuntimeError("bad")):
+            body, status = self.run_check()
+        self.assertEqual(status, 200)
+        self.assertEqual(self.health_state()["last_status"], "ok")
+
+
 class HealthAlertingTest(PipelineTestBase):
     """The failure-detection layer: it has to work when nothing else does."""
 

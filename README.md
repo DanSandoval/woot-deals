@@ -493,6 +493,20 @@ the recent run starts in `health_state.json`, not assumed, so changing the
 schedule needs no code change. A fixed ceiling of 800 used to do this job; it
 suited 30-minute runs and would have blocked the fallback every evening at 20.
 
+Whether a faster schedule would catch more is measured, not guessed. Each run logs
+a `WOOT_TIMING` line from the dates and sold-out flags the feeds already carry:
+
+```
+WOOT_TIMING new=374 new_sold_out=0 new_not_started=0 new_undated=0 sold_out=812/10652
+  new_age_min_p50=9 new_age_min_p90=17 new_age_min_max=19 lifespan_h_p10=24.0 lifespan_h_p50=72.0
+```
+
+`new_age_min_*` is how long offers seen for the first time had been up, so it is
+how late a text can be. `new_sold_out` counts offers that were already gone when
+first seen, which are the deals a faster schedule could have caught; if it stays
+near zero over a few days, running more often buys nothing. The numbers above
+show the format, not real values. Nothing alerts on this line.
+
 If the logs show `complete=False` in the run summary, the feed was cut short and
 the offers on the pages that were never reached are deliberately left unrecorded
 so the next run retries them. Persistent `complete=False` means the pacing needs
