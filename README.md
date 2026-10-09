@@ -507,6 +507,12 @@ first seen, which are the deals a faster schedule could have caught; if it stays
 near zero over a few days, running more often buys nothing. The numbers above
 show the format, not real values. Nothing alerts on this line.
 
+The other way to a faster schedule is fewer requests per run. Each fetch also logs
+a `WOOT_FEEDS` line counting the offers in each exact combination of feeds, for
+example `{"complete":true,"sets":{"All+Home":4100,"Home":900,"Clearance+Tools":40}}`.
+Skipping a set of feeds loses exactly the offers whose combination is made up only
+of skipped feeds, so a few days of these lines show which feeds add nothing.
+
 If the logs show `complete=False` in the run summary, the feed was cut short and
 the offers on the pages that were never reached are deliberately left unrecorded
 so the next run retries them. Persistent `complete=False` means the pacing needs

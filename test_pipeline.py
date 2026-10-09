@@ -1109,6 +1109,38 @@ class OfferTimingTest(PipelineTestBase):
         self.assertEqual(self.health_state()["last_status"], "ok")
 
 
+class FeedOverlapTest(PipelineTestBase):
+    """Which combinations of feeds each offer appears in."""
+
+    def test_offers_are_counted_once_under_their_exact_feeds(self):
+        membership = {
+            "a": {"Home", "All"},
+            "b": {"Home"},
+            "c": {"All", "Home"},
+            "d": {"Featured", "Home", "All"},
+        }
+        self.assertEqual(main.feed_overlap(membership),
+                         {"All+Home": 2, "All+Featured+Home": 1, "Home": 1})
+
+    def test_each_fetch_logs_every_offer_under_one_combination(self):
+        main.start_run_budget()
+        with self.assertLogs(level="INFO") as captured:
+            items, complete = main.fetch_feed()
+        lines = [r.getMessage() for r in captured.records
+                 if r.getMessage().startswith(main.FEEDS_MARKER + " ")]
+        self.assertEqual(len(lines), 1)
+        overlap = json.loads(lines[0][len(main.FEEDS_MARKER) + 1:])
+        self.assertTrue(overlap["complete"])
+        self.assertEqual(sum(overlap["sets"].values()), len(items))
+
+    def test_an_overlap_failure_does_not_break_the_fetch(self):
+        main.start_run_budget()
+        with mock.patch.object(main, "feed_overlap", side_effect=RuntimeError("bad")):
+            items, complete = main.fetch_feed()
+        self.assertTrue(complete)
+        self.assertEqual(len(items), CATALOG_SIZE)
+
+
 class HealthAlertingTest(PipelineTestBase):
     """The failure-detection layer: it has to work when nothing else does."""
 

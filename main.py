@@ -355,6 +355,11 @@ HEALTH_MARKER = "WOOT_HEALTH"
 # the schedule misses, from data every run already fetches.
 TIMING_MARKER = "WOOT_TIMING"
 
+# And one more: how many offers sit in each combination of feeds. An offer only
+# in feeds a run skipped would be missed, so this shows which feeds could be
+# dropped to free requests for a faster schedule, again from data already fetched.
+FEEDS_MARKER = "WOOT_FEEDS"
+
 # Not everything worth recording is worth interrupting someone for. Every check
 # below used to escalate the run to "degraded", which is what the paging metric
 # counts, so twenty-odd conditions ranging from "the service is down" to "a Woot
@@ -2116,6 +2121,7 @@ def fetch_feed():
                         "feeds_ok": 0, "feeds_failed": 0, "raw_items": 0})
 
     merged = {}
+    membership = {}
     failed = []
 
     for feed_name in FEED_NAMES:
@@ -2140,6 +2146,7 @@ def fetch_feed():
             offer_id = item.get("OfferId") or item.get("Id")
             if offer_id:
                 merged[offer_id] = item
+                membership.setdefault(offer_id, set()).add(feed_name)
 
         if ok:
             _feed_stats["feeds_ok"] += 1
@@ -2160,7 +2167,29 @@ def fetch_feed():
         f"{_feed_stats['feeds_ok']}/{len(FEED_NAMES)} feeds into "
         f"{len(all_items)} distinct offers, complete={complete}"
     )
+    # Observe-only, so it must never be able to break the run.
+    try:
+        overlap = {"complete": complete, "sets": feed_overlap(membership)}
+        logging.info(f"{FEEDS_MARKER} {json.dumps(overlap, separators=(',', ':'))}")
+    except Exception as e:
+        logging.warning(f"Could not measure feed overlap: {e}")
     return all_items, complete
+
+
+def feed_overlap(membership):
+    """
+    How many offers appear in exactly each combination of feeds, largest first.
+
+    Keyed like "All+Home", in FEED_NAMES order. A key with one feed counts the
+    offers only that feed carries; the offers lost by skipping several feeds are
+    the keys made up only of those feeds.
+    """
+    order = {name: i for i, name in enumerate(FEED_NAMES)}
+    counts = {}
+    for feeds in membership.values():
+        key = "+".join(sorted(feeds, key=lambda name: order.get(name, len(order))))
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
 def _fetch_feed_paginated(feed_name="All"):
