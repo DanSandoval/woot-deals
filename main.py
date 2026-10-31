@@ -19,6 +19,7 @@ from flask import Flask, request
 import random
 import html
 import hashlib
+import gzip
 import anthropic
 
 # Set up detailed logging
@@ -108,6 +109,23 @@ EMAIL_RECIPIENT = os.environ.get("EMAIL_RECIPIENT")
 # GCS configuration
 BUCKET_NAME = os.environ.get("BUCKET_NAME")
 SEEN_DEALS_FILENAME = "seen_deals.json"
+
+# --- Catalogue export for the search site ------------------------------------
+# Every complete run writes the merged catalogue it has already downloaded to a
+# bucket of its own, where the search site on the home server picks it up. That
+# site cannot poll Woot itself: this service spends most of the key's daily
+# quota, and a second key to get round that is not allowed. Unset = no export.
+# The file is a contract with that reader (woot-search/ in the server repo):
+# bump CATALOG_VERSION on any change it would misread.
+CATALOG_BUCKET = os.environ.get("CATALOG_BUCKET")
+CATALOG_FILENAME = "catalog.json.gz"
+CATALOG_VERSION = 1
+CATALOG_FIELDS = ("OfferId", "Title", "Url", "Photo", "Site", "Condition", "Categories",
+                  "SalePrice", "ListPrice", "IsSoldOut", "IsWootOff", "IsFeatured",
+                  "StartDate", "EndDate")
+CATALOG_UPLOAD_TIMEOUT = 20  # seconds
+# Skip the export rather than let it push a slow run past its deadline.
+CATALOG_BUDGET_RESERVE = CATALOG_UPLOAD_TIMEOUT + 5
 
 # --- Keyword commands by email ------------------------------------------------
 # The keyword list lives in the bucket and is edited by emailing the tracker's
@@ -393,6 +411,7 @@ NOTABLE_EVENTS = frozenset({
     "jev_unavailable",         # matches were texted unscreened; nothing was lost
     "keyword_screen_failed",   # a keyword's screen is not set up yet; retried later
     "keyword_screens_unreadable",  # Claude-described screens off; matches still texted
+    "catalog_export_failed",   # the search site shows older data; alerts unaffected
 })
 
 # The floor has to sit ABOVE the failure it exists to catch: the original
@@ -890,6 +909,51 @@ def save_seen_deals(seen_deals):
         logging.error(f"Error saving seen deals: {e}")
         logging.error(traceback.format_exc())
         return False
+
+
+def export_catalog(feed_items, now=None):
+    """
+    Write the merged catalogue to CATALOG_BUCKET for the search site.
+
+    Call only after a complete feed read: the reader treats an offer missing
+    from the file as gone from Woot, so a partial catalogue would wrongly end
+    the offers on the feeds that failed. Returns the value for the health line:
+    the number of offers written, "off", "skipped" or "failed". It never raises,
+    and a failure is only a note, because deal alerts do not depend on it.
+    """
+    if not CATALOG_BUCKET:
+        return "off"
+    if budget_remaining() < CATALOG_BUDGET_RESERVE:
+        record_health_event("catalog_export_failed",
+                            f"skipped with {budget_remaining():.0f}s of the run budget left")
+        return "skipped"
+    try:
+        offers = []
+        for item in feed_items:
+            offer_id = item.get("OfferId") or item.get("Id")
+            if not offer_id:
+                continue
+            record = {field: item.get(field) for field in CATALOG_FIELDS}
+            record["OfferId"] = offer_id
+            offers.append(record)
+        payload = {
+            "version": CATALOG_VERSION,
+            "generated_at": (now or datetime.now(timezone.utc)).isoformat(),
+            "complete": True,
+            "count": len(offers),
+            "offers": offers,
+        }
+        data = gzip.compress(json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+                             mtime=0)
+        blob = storage_client.bucket(CATALOG_BUCKET).blob(CATALOG_FILENAME)
+        blob.upload_from_string(data, content_type="application/gzip",
+                                timeout=CATALOG_UPLOAD_TIMEOUT)
+        logging.info(f"Exported {len(offers)} offers ({len(data)} bytes) "
+                     f"to gs://{CATALOG_BUCKET}/{CATALOG_FILENAME}")
+        return len(offers)
+    except Exception as e:
+        record_health_event("catalog_export_failed", f"{type(e).__name__}: {e}")
+        return "failed"
 
 def load_keywords():
     """
@@ -3357,7 +3421,11 @@ def _run_deal_check():
                 f"{SEEN_DEALS_RETENTION_DAYS}-day retention but survived the prune"
             )
 
-    # Step 6: with whatever budget is left, set up one Jev screen still missing.
+    # Step 6: hand the catalogue to the search site. Only a complete read is
+    # exported, since the reader ends any offer missing from the file.
+    metrics["catalog"] = export_catalog(feed_items) if feed_complete else "incomplete"
+
+    # Step 7: with whatever budget is left, set up one Jev screen still missing.
     # Last, so it only spends time this run's own work did not need.
     set_up_pending_screen(feed_items)
 

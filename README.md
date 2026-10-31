@@ -201,6 +201,18 @@ Production needs its own Anthropic API key, set as the Cloud Run env var
 `ANTHROPIC_API_KEY`; give it a monthly spend limit in the Claude Console. Each
 setup is one Claude call, about 5 cents.
 
+### Catalogue export
+
+With the env var `CATALOG_BUCKET` set, every run that read all 11 feeds writes
+the merged catalogue to `gs://$CATALOG_BUCKET/catalog.json.gz` for a search
+site that runs elsewhere and cannot call the Woot API itself (the quota is
+spent here). It costs no Woot requests. An incomplete read is never exported,
+because the reader treats an offer missing from the file as gone. The health
+line shows `catalog=<offers written>`, `off`, `incomplete`, `skipped` or
+`failed`; a failure is the notable event `catalog_export_failed` and never
+pages. The format is versioned by `CATALOG_VERSION`; `export_catalog` in
+`main.py` documents it.
+
 ## Monitoring
 
 Check the Cloud Run logs for service activity:

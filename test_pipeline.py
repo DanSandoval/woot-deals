@@ -8,6 +8,7 @@ fetch through notification can be exercised without credentials.
 
 Run: python test_pipeline.py
 """
+import gzip
 import json
 import os
 import unittest
@@ -202,7 +203,7 @@ class FakeBlob:
     def download_as_text(self):
         return self.store[self.name]
 
-    def upload_from_string(self, data, content_type=None):
+    def upload_from_string(self, data, content_type=None, timeout=None):
         self.store[self.name] = data
 
 
@@ -1139,6 +1140,92 @@ class FeedOverlapTest(PipelineTestBase):
             items, complete = main.fetch_feed()
         self.assertTrue(complete)
         self.assertEqual(len(items), CATALOG_SIZE)
+
+
+class CatalogExportTest(PipelineTestBase):
+    """
+    Complete runs hand the merged catalogue to the search site on the home server.
+
+    The reader ends every offer missing from the file, so a partial catalogue
+    must never be written, and the export must never be able to hurt deal alerts.
+    """
+
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch.object(main, "CATALOG_BUCKET", "catalog-bucket")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def catalog(self):
+        return json.loads(gzip.decompress(self.store[main.CATALOG_FILENAME]))
+
+    def test_a_complete_run_exports_every_offer(self):
+        line = self.health_line()
+        payload = self.catalog()
+        self.assertEqual(payload["version"], main.CATALOG_VERSION)
+        self.assertTrue(payload["complete"])
+        self.assertEqual(payload["count"], CATALOG_SIZE)
+        self.assertEqual(len(payload["offers"]), CATALOG_SIZE)
+        ids = [o["OfferId"] for o in payload["offers"]]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertIn(f"catalog={CATALOG_SIZE}", line)
+        self.assertIn("status=ok", line)
+
+    def test_each_offer_carries_exactly_the_contract_fields(self):
+        self.run_check()
+        offer = next(o for o in self.catalog()["offers"] if o["OfferId"] == "offer-04200")
+        self.assertEqual(tuple(offer), main.CATALOG_FIELDS)
+        self.assertEqual(offer["Title"], "Kindle Paperwhite 16GB")
+        self.assertEqual(offer["Url"], "https://woot.com/offers/kindle-paperwhite-16gb")
+        self.assertEqual(offer["Categories"], ["Electronics"])
+
+    def test_nothing_is_exported_when_switched_off(self):
+        with mock.patch.object(main, "CATALOG_BUCKET", None):
+            line = self.health_line()
+        self.assertNotIn(main.CATALOG_FILENAME, self.store)
+        self.assertIn("catalog=off", line)
+
+    def test_an_incomplete_read_is_never_exported(self):
+        # The search site would mark every offer on the failed feed as ended.
+        real = self.api.request
+
+        def request(method, url, **kwargs):
+            if "/feed/Sports" in url:
+                return FakeResponse(500, {"message": "boom"})
+            return real(method, url, **kwargs)
+
+        with mock.patch.object(main.requests, "request", request):
+            line = self.health_line()
+        self.assertIn("feed_complete=false", line)
+        self.assertIn("catalog=incomplete", line)
+        self.assertNotIn(main.CATALOG_FILENAME, self.store)
+
+    def test_an_upload_failure_is_only_a_note(self):
+        real_upload = FakeBlob.upload_from_string
+
+        def upload(blob, data, **kwargs):
+            if blob.name == main.CATALOG_FILENAME:
+                raise OSError("bucket gone")
+            real_upload(blob, data, **kwargs)
+
+        with mock.patch.object(FakeBlob, "upload_from_string", upload):
+            line = self.health_line()
+        self.assertIn("status=ok", line)
+        self.assertIn("catalog_export_failed", line.split("notes=")[1].split(" ")[0])
+        self.assertIn("catalog=failed", line)
+        self.assertEqual(self.alerts, [])
+        # Deal state still advanced, so nothing is re-sent next run.
+        self.assertIn(main.SEEN_DEALS_FILENAME, self.store)
+
+    def test_a_run_short_of_budget_skips_the_export(self):
+        main.start_run_budget()
+        main._run_deadline = self.api.monotonic() + main.CATALOG_BUDGET_RESERVE - 1
+        self.assertEqual(main.export_catalog([make_item(1)]), "skipped")
+        self.assertNotIn(main.CATALOG_FILENAME, self.store)
+        self.assertEqual([e["kind"] for e in main._health_events], ["catalog_export_failed"])
+
+    def test_the_export_failure_is_notable_not_paging(self):
+        self.assertIn("catalog_export_failed", main.NOTABLE_EVENTS)
 
 
 class HealthAlertingTest(PipelineTestBase):
